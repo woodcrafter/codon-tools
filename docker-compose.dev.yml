@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: codon_tools_db
+      POSTGRES_USER: codon_tools_user
+      POSTGRES_PASSWORD: codon_tools_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - codon_tools_pgdata:/var/lib/postgresql/data
+
+volumes:
+  codon_tools_pgdata:

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.manus-logs
+node_modules
+dist
+tmp
+deployment
+pnpm-debug.log
+*.local
+*.md
+*.docx

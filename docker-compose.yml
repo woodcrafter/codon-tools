@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: codon_tools_db
+      POSTGRES_USER: codon_tools_user
+      POSTGRES_PASSWORD: codon_tools_password
+    ports:
+      - "5434:5432"
+    volumes:
+      - codon_tools_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codon_tools_user -d codon_tools_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://codon_tools_user:codon_tools_password@db:5432/codon_tools_db
+      DNAWORKS_EXECUTABLE_PATH: /opt/DNAWorks/dnaworks
+      DNAWORKS_WORKDIR: /tmp
+    labels:
+      - dev.orbstack.domains=app.protein-production-platform.orb.local
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  codon_tools_db_data:
