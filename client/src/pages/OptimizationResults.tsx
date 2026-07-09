@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useParams, useLocation } from "wouter";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { trpc } from "@/lib/trpc";
-import { ArrowLeft, ArrowRight, Check, Copy, FileText, FileSpreadsheet, RefreshCw } from "lucide-react";
+import { ArrowLeft, Check, Copy, FileText, FileSpreadsheet, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import * as XLSX from "xlsx";
 
@@ -14,7 +14,7 @@ export default function OptimizationResults() {
   const [, setLocation] = useLocation();
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [detailResult, setDetailResult] = useState<any | null>(null);
-  const [copiedId, setCopiedId] = useState<number | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
   const { data, isLoading, error } = trpc.optimizationJobs.getByJobId.useQuery(
     { jobId: params.jobId || "" },
@@ -43,20 +43,109 @@ export default function OptimizationResults() {
   };
 
   const handleDownloadExcel = () => {
-    const rows = results.map((r: any) => ({
+    const summaryRows = results.map((r: any) => ({
       基因名称: r.geneName,
+      优化后序列: r.optimizedSequence ?? "",
+      原始序列: r.originalSequence ?? "",
+      序列长度: (r.optimizedSequence ?? "").replace(/\s/g, "").length || "",
+      CAI得分: r.caiScore ?? "",
       平均GC含量: r.avgGcContent ? `${r.avgGcContent}%` : "",
+      重复序列统计: formatRepeatStats(r.repeatStats),
       表达宿主: r.hostName ?? "",
       二级表达宿主: r.secondaryHostName ?? "",
       避免的酶切位点: r.avoidEnzymesDisplay ?? "",
-      重复序列统计: formatRepeatStats(r.repeatStats),
-      CAI得分: r.caiScore ?? "",
-      原始序列: r.originalSequence ?? "",
-      优化后序列: r.optimizedSequence ?? "",
     }));
-    const ws = XLSX.utils.json_to_sheet(rows);
+
+    const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+    summarySheet["!cols"] = [
+      { wch: 18 },
+      { wch: 48 },
+      { wch: 48 },
+      { wch: 12 },
+      { wch: 10 },
+      { wch: 12 },
+      { wch: 24 },
+      { wch: 22 },
+      { wch: 18 },
+      { wch: 24 },
+    ];
+    summarySheet["!autofilter"] = { ref: "A1:J1" };
+
+    const detailRows = results.flatMap((r: any) => {
+      const groups = getGroupedRepeatPairs(r.repeatStats);
+      if (!groups.length) {
+        return [{
+          基因名称: r.geneName ?? "",
+          重复序列统计: formatRepeatStats(r.repeatStats),
+          类型: "—",
+          重复序列: "未检测到达到阈值的重复序列",
+          配对序列: "—",
+          位置1: "—",
+          位置2: "—",
+          长度: "—",
+        }];
+      }
+
+      return groups.map((group: any) => ({
+        基因名称: r.geneName ?? "",
+        重复序列统计: formatRepeatStats(r.repeatStats),
+        类型: group.type ?? "",
+        重复序列: group.sequence1 ?? "",
+        配对序列:
+          group.type === "DR" || !group.sequence2 || group.sequence2 === group.sequence1
+            ? group.sequence1 ?? ""
+            : group.sequence2,
+        位置1: formatRepeatRangeList(group.position1List, group.length),
+        位置2: formatRepeatRangeList(group.position2List, group.length),
+        长度: group.length ? `${group.length} nt` : "",
+      }));
+    });
+
+    const detailSheetRows: Array<Array<string>> = [
+      ["优化结果重复序列明细"],
+      [`Job ID: ${job?.jobId ?? params.jobId ?? ""}`, `批号: ${job?.batchNo || "-"}`, `导出时间: ${formatReportDate(new Date())}`],
+      ["说明：每一行对应一条重复片段；位置采用 1-based 闭区间表示。"],
+      [],
+      ["基因名称", "重复序列统计", "类型", "重复序列", "配对序列", "位置1", "位置2", "长度"],
+      ...detailRows.map((row: any) => [
+        row.基因名称,
+        row.重复序列统计,
+        row.类型,
+        row.重复序列,
+        row.配对序列,
+        row.位置1,
+        row.位置2,
+        row.长度,
+      ]),
+    ];
+
+    const detailSheet = XLSX.utils.aoa_to_sheet(detailSheetRows);
+    detailSheet["!merges"] = [
+      { s: { r: 0, c: 0 }, e: { r: 0, c: 7 } },
+      { s: { r: 2, c: 0 }, e: { r: 2, c: 7 } },
+    ];
+    detailSheet["!cols"] = [
+      { wch: 18 },
+      { wch: 24 },
+      { wch: 8 },
+      { wch: 26 },
+      { wch: 26 },
+      { wch: 14 },
+      { wch: 14 },
+      { wch: 10 },
+    ];
+    detailSheet["!rows"] = [
+      { hpt: 24 },
+      { hpt: 20 },
+      { hpt: 20 },
+      { hpt: 8 },
+      { hpt: 20 },
+    ];
+    detailSheet["!autofilter"] = { ref: `A5:H${Math.max(5, detailSheetRows.length)}` };
+
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "优化结果");
+    XLSX.utils.book_append_sheet(wb, summarySheet, "优化结果");
+    XLSX.utils.book_append_sheet(wb, detailSheet, "重复序列明细");
     const filename = `优化结果_${job?.jobId ?? params.jobId}.xlsx`;
     XLSX.writeFile(wb, filename);
     toast.success("Excel 已下载");
@@ -71,47 +160,68 @@ export default function OptimizationResults() {
     rerunMutation.mutate({ jobId: params.jobId });
   };
 
-  const handleGoToPrimerDesign = () => {
-    const jobId = job?.jobId ?? params.jobId;
-    const picked = selectedIds.length > 0 ? results.filter((r: any) => selectedIds.includes(r.id)) : results;
-    const items = picked
-      .map((r: any) => ({
-        geneName: r.geneName ?? "",
-        targetSequence: (r.optimizedSequence ?? "").toString(),
-      }))
-      .filter((x: any) => x.geneName && x.targetSequence);
+  const fallbackCopyText = (text: string) => {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "true");
+    textarea.style.position = "fixed";
+    textarea.style.top = "0";
+    textarea.style.left = "-9999px";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
 
-    if (items.length === 0) {
-      toast.error("没有可用于引物设计的优化序列");
-      return;
-    }
+    const selection = document.getSelection();
+    const originalRange =
+      selection && selection.rangeCount > 0 ? selection.getRangeAt(0) : null;
 
+    textarea.focus();
+    textarea.select();
+    textarea.setSelectionRange(0, textarea.value.length);
+
+    let copied = false;
     try {
-      sessionStorage.setItem(
-        `primerSeed:${jobId}`,
-        JSON.stringify({ source: "optimization", jobId, items })
-      );
-    } catch {
-      toast.error("写入跳转数据失败");
-      return;
+      copied = document.execCommand("copy");
+    } finally {
+      document.body.removeChild(textarea);
+      if (selection) {
+        selection.removeAllRanges();
+        if (originalRange) {
+          selection.addRange(originalRange);
+        }
+      }
     }
 
-    toast.success("已导入到引物设计", { description: `共 ${items.length} 条` });
-    setLocation(`/primers?from=optimization&jobId=${encodeURIComponent(jobId)}`);
+    return copied;
   };
 
-  const handleCopyOptimizedSequence = async (id: number, sequence?: string | null) => {
+  const handleCopyText = async (
+    key: string,
+    sequence: string | null | undefined,
+    successMessage: string,
+    emptyMessage: string
+  ) => {
     if (!sequence) {
-      toast.error("当前条目暂无可复制序列");
+      toast.error(emptyMessage);
       return;
     }
+
     try {
-      await navigator.clipboard.writeText(sequence);
-      setCopiedId(id);
-      toast.success("优化后序列已复制");
-      setTimeout(() => setCopiedId((prev) => (prev === id ? null : prev)), 1500);
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(sequence);
+      } else if (!fallbackCopyText(sequence)) {
+        throw new Error("Clipboard unavailable");
+      }
+      setCopiedKey(key);
+      toast.success(successMessage);
+      setTimeout(() => setCopiedKey((prev) => (prev === key ? null : prev)), 1500);
     } catch {
-      toast.error("复制失败，请重试");
+      if (fallbackCopyText(sequence)) {
+        setCopiedKey(key);
+        toast.success(successMessage);
+        setTimeout(() => setCopiedKey((prev) => (prev === key ? null : prev)), 1500);
+      } else {
+        toast.error("复制失败，请重试");
+      }
     }
   };
 
@@ -152,6 +262,73 @@ export default function OptimizationResults() {
     const minLength = Number(repeatStats.minLength ?? 9);
     if (total <= 0) return `0（阈值 ${minLength} nt）`;
     return `${total}（DR ${direct} / IR ${inverted} / PR ${palindromic}）`;
+  };
+
+  const getRepeatRangeLabel = (position: number, length: number) => {
+    const start = Number(position || 0);
+    const size = Number(length || 0);
+    if (start <= 0 || size <= 0) return "—";
+    return `${start}-${start + size - 1}`;
+  };
+
+  const getGroupedRepeatPairs = (repeatStats?: any | null) => {
+    const pairs = Array.isArray(repeatStats?.pairs) ? repeatStats.pairs : [];
+    const groups = new Map<string, any>();
+
+    for (const pair of pairs) {
+      const sequence1 = pair.sequence1 ?? "";
+      const sequence2 =
+        pair.type === "DR" || !pair.sequence2 || pair.sequence2 === pair.sequence1
+          ? sequence1
+          : pair.sequence2;
+      const key = [pair.type ?? "", pair.length ?? 0, sequence1, sequence2].join("::");
+      const existing = groups.get(key);
+      if (existing) {
+        if (!existing.position1List.includes(pair.position1)) existing.position1List.push(pair.position1);
+        if (!existing.position2List.includes(pair.position2)) existing.position2List.push(pair.position2);
+      } else {
+        groups.set(key, {
+          type: pair.type ?? "",
+          length: Number(pair.length ?? 0),
+          sequence1,
+          sequence2,
+          position1List: [pair.position1],
+          position2List: [pair.position2],
+        });
+      }
+    }
+
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        position1List: group.position1List.sort((a: number, b: number) => a - b),
+        position2List: group.position2List.sort((a: number, b: number) => a - b),
+      }))
+      .sort((a, b) => {
+        const firstPos1A = a.position1List[0] ?? 0;
+        const firstPos1B = b.position1List[0] ?? 0;
+        if (firstPos1A !== firstPos1B) return firstPos1A - firstPos1B;
+        const firstPos2A = a.position2List[0] ?? 0;
+        const firstPos2B = b.position2List[0] ?? 0;
+        if (firstPos2A !== firstPos2B) return firstPos2A - firstPos2B;
+        return b.length - a.length;
+      });
+  };
+
+  const formatRepeatRangeList = (positions: number[], length: number) => {
+    if (!Array.isArray(positions) || !positions.length) return "—";
+    return positions.map((position) => getRepeatRangeLabel(position, length)).join(", ");
+  };
+
+  const formatRepeatPairs = (repeatStats?: any | null) => {
+    const groups = getGroupedRepeatPairs(repeatStats);
+    if (!groups.length) return "—";
+    return groups
+      .map((group: any) => {
+        const sequence = group.sequence1 || group.sequence2 || "";
+        return `${group.type} ${sequence} [${formatRepeatRangeList(group.position1List, group.length)} / ${formatRepeatRangeList(group.position2List, group.length)}]`;
+      })
+      .join("; ");
   };
 
   if (isLoading || !params.jobId) {
@@ -208,7 +385,7 @@ export default function OptimizationResults() {
       <Card className="print:hidden">
         <CardContent className="p-0">
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[1110px]">
+            <table className="w-full min-w-[1160px]">
               <thead className="bg-muted">
                 <tr>
                   <th className="border p-2 text-sm font-medium w-12">
@@ -220,10 +397,11 @@ export default function OptimizationResults() {
                   </th>
                   <th className="border p-2 text-sm font-medium min-w-[120px]">基因名称</th>
                   <th className="border p-2 text-sm font-medium min-w-[100px]">平均GC含量</th>
-                  <th className="border p-2 text-sm font-medium min-w-[180px]">表达宿主</th>
-                  <th className="border p-2 text-sm font-medium min-w-[120px]">二级表达宿主</th>
-                  <th className="border p-2 text-sm font-medium min-w-[200px]">避免的酶切位点</th>
-                  <th className="border p-2 text-sm font-medium min-w-[220px]">重复序列统计</th>
+                  <th className="border p-2 text-sm font-medium min-w-[100px]">CAI 得分</th>
+                  <th className="border p-2 text-sm font-medium min-w-[160px]">表达宿主</th>
+                  <th className="border p-2 text-sm font-medium min-w-[110px]">二级表达宿主</th>
+                  <th className="border p-2 text-sm font-medium min-w-[180px]">避免的酶切位点</th>
+                  <th className="border p-2 pr-3 text-sm font-medium min-w-[180px] whitespace-nowrap">重复序列统计</th>
                   <th className="sticky right-0 z-20 border bg-muted p-2 text-sm font-medium min-w-[120px] whitespace-nowrap shadow-[-1px_0_0_0_hsl(var(--border))]">
                     优化结果
                   </th>
@@ -242,14 +420,13 @@ export default function OptimizationResults() {
                     <td className="border p-2 text-sm">
                       {r.avgGcContent ? `${r.avgGcContent}%` : "—"}
                     </td>
-                    <td className="border p-2 text-sm">{r.hostName ?? "—"}</td>
+                    <td className="border p-2 text-sm">{r.caiScore ?? "—"}</td>
+                    <td className="border p-2 text-sm break-words">{r.hostName ?? "—"}</td>
                     <td className="border p-2 text-sm">{r.secondaryHostName ?? "—"}</td>
-                    <td className="border p-2 text-sm text-muted-foreground">
+                    <td className="border p-2 text-sm text-muted-foreground break-words">
                       {r.avoidEnzymesDisplay ?? "—"}
                     </td>
-                    <td className="border p-2 text-sm">
-                      {formatRepeatStats(r.repeatStats)}
-                    </td>
+                    <td className="border p-2 pr-3 text-sm whitespace-nowrap">{formatRepeatStats(r.repeatStats)}</td>
                     <td className="sticky right-0 z-10 border bg-background p-2 text-sm whitespace-nowrap shadow-[-1px_0_0_0_hsl(var(--border))]">
                       <div className="inline-flex items-center gap-1">
                         <Button
@@ -265,9 +442,16 @@ export default function OptimizationResults() {
                           size="icon"
                           className="h-7 w-7"
                           title="复制优化后序列"
-                          onClick={() => handleCopyOptimizedSequence(r.id, r.optimizedSequence)}
+                          onClick={() =>
+                            handleCopyText(
+                              `row-${r.id}`,
+                              r.optimizedSequence,
+                              "优化后序列已复制",
+                              "当前条目暂无可复制序列"
+                            )
+                          }
                         >
-                          {copiedId === r.id ? <Check className="h-3.5 w-3.5 text-green-600" /> : <Copy className="h-3.5 w-3.5 text-muted-foreground" />}
+                          {copiedKey === `row-${r.id}` ? <Check className="h-3.5 w-3.5 text-green-600" /> : <Copy className="h-3.5 w-3.5 text-muted-foreground" />}
                         </Button>
                       </div>
                     </td>
@@ -303,6 +487,7 @@ export default function OptimizationResults() {
               <p><span className="font-semibold">Size:</span> {getSequenceSizeLabel(r.originalSequence)}</p>
               <p><span className="font-semibold">Excluded enzyme sites:</span> {r.avoidEnzymesDisplay || "[]"}</p>
               <p><span className="font-semibold">Repeat Stats:</span> {formatRepeatStats(r.repeatStats)}</p>
+              <p><span className="font-semibold">Repeat Details:</span> {formatRepeatPairs(r.repeatStats)}</p>
               <p><span className="font-semibold">CAI:</span> {r.caiScore || "—"}</p>
               <p><span className="font-semibold">GC%:</span> {r.avgGcContent ? `${r.avgGcContent}%` : "—"}</p>
             </div>
@@ -319,7 +504,7 @@ export default function OptimizationResults() {
       </div>
 
       <Dialog open={!!detailResult} onOpenChange={(o) => !o && setDetailResult(null)}>
-        <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto overflow-x-hidden rounded-2xl border-border/60 p-0">
+        <DialogContent className="w-[95vw] sm:max-w-6xl max-h-[85vh] overflow-y-auto rounded-2xl border-border/60 p-0">
           <DialogHeader>
             <DialogTitle className="px-6 pt-6 pb-4 text-lg">{detailResult?.geneName ?? ""} 优化详情</DialogTitle>
           </DialogHeader>
@@ -340,28 +525,88 @@ export default function OptimizationResults() {
                 </div>
               </div>
               <div className="space-y-2">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">原始序列</p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">原始序列</p>
+                </div>
                 <pre className="max-h-44 overflow-y-scroll overflow-x-hidden rounded-xl border bg-muted/30 p-3 pr-2 text-xs leading-6 font-mono whitespace-pre-wrap break-words">
                   {formatSequenceForView(detailResult.originalSequence)}
                 </pre>
               </div>
               <div className="space-y-2">
-                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">优化后序列</p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">优化后序列</p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1"
+                    onClick={() =>
+                      handleCopyText(
+                        `detail-optimized-${detailResult.id ?? detailResult.geneName ?? "unknown"}`,
+                        detailResult.optimizedSequence,
+                        "优化后序列已复制",
+                        "当前条目暂无优化后序列"
+                      )
+                    }
+                  >
+                    {copiedKey === `detail-optimized-${detailResult.id ?? detailResult.geneName ?? "unknown"}` ? (
+                      <Check className="h-3.5 w-3.5 text-green-600" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    复制
+                  </Button>
+                </div>
                 <pre className="max-h-60 overflow-y-scroll overflow-x-hidden rounded-xl border border-primary/20 bg-primary/5 p-3 pr-2 text-xs leading-6 font-mono whitespace-pre-wrap break-words">
                   {formatSequenceForView(detailResult.optimizedSequence)}
                 </pre>
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">重复序列明细</p>
+                {!getGroupedRepeatPairs(detailResult.repeatStats).length ? (
+                  <div className="rounded-xl border bg-muted/20 p-3 text-sm text-muted-foreground">
+                    未检测到达到阈值的重复序列
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-xl border">
+                    <table className="w-full min-w-[760px]">
+                      <thead className="bg-muted/60">
+                        <tr>
+                          <th className="border p-2 text-left text-xs font-medium">类型</th>
+                          <th className="border p-2 text-left text-xs font-medium">重复序列</th>
+                          <th className="border p-2 text-left text-xs font-medium">位置 1</th>
+                          <th className="border p-2 text-left text-xs font-medium">位置 2</th>
+                          <th className="border p-2 text-left text-xs font-medium">长度</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getGroupedRepeatPairs(detailResult.repeatStats).map((group: any, index: number) => (
+                          <tr key={`${group.type}_${group.sequence1}_${group.length}_${index}`} className="hover:bg-muted/30">
+                            <td className="border p-2 text-xs font-medium">{group.type}</td>
+                            <td className="border p-2 text-xs font-mono break-all">
+                              {group.sequence1}
+                              {group.type !== "DR" && group.sequence2 && group.sequence2 !== group.sequence1 ? (
+                                <Fragment>
+                                  <span className="mx-1 text-muted-foreground">/</span>
+                                  {group.sequence2}
+                                </Fragment>
+                              ) : null}
+                            </td>
+                            <td className="border p-2 text-xs font-mono">{formatRepeatRangeList(group.position1List, group.length)}</td>
+                            <td className="border p-2 text-xs font-mono">{formatRepeatRangeList(group.position2List, group.length)}</td>
+                            <td className="border p-2 text-xs font-mono">{group.length} nt</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
               </div>
             </div>
           )}
         </DialogContent>
       </Dialog>
 
-      <div className="flex justify-center gap-4 mt-6 print:hidden">
-        <Button variant="outline" onClick={handleGoToPrimerDesign}>
-          <ArrowRight className="h-4 w-4 mr-2" />
-          引物合成
-        </Button>
-      </div>
     </div>
   );
 }

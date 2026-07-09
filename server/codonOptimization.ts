@@ -3,79 +3,9 @@
  * Implements codon optimization algorithms inspired by DNAWorks
  */
 
-// Codon usage tables for different host species
-// Values represent relative frequency (0-1) of each codon
-const CODON_TABLES: Record<string, Record<string, Record<string, number>>> = {
-  "E. coli": {
-    A: { GCG: 0.36, GCA: 0.21, GCC: 0.27, GCT: 0.16 },
-    R: { CGT: 0.38, CGC: 0.36, CGA: 0.07, CGG: 0.10, AGA: 0.04, AGG: 0.02 },
-    N: { AAT: 0.45, AAC: 0.55 },
-    D: { GAT: 0.63, GAC: 0.37 },
-    C: { TGT: 0.45, TGC: 0.55 },
-    Q: { CAA: 0.34, CAG: 0.66 },
-    E: { GAA: 0.68, GAG: 0.32 },
-    G: { GGT: 0.35, GGC: 0.37, GGA: 0.13, GGG: 0.15 },
-    H: { CAT: 0.57, CAC: 0.43 },
-    I: { ATT: 0.49, ATC: 0.39, ATA: 0.11 },
-    L: { TTA: 0.13, TTG: 0.13, CTT: 0.12, CTC: 0.10, CTA: 0.04, CTG: 0.50 },
-    K: { AAA: 0.74, AAG: 0.26 },
-    M: { ATG: 1.00 },
-    F: { TTT: 0.57, TTC: 0.43 },
-    P: { CCT: 0.18, CCC: 0.13, CCA: 0.20, CCG: 0.49 },
-    S: { TCT: 0.17, TCC: 0.15, TCA: 0.14, TCG: 0.15, AGT: 0.16, AGC: 0.28 },
-    T: { ACT: 0.19, ACC: 0.40, ACA: 0.17, ACG: 0.25 },
-    W: { TGG: 1.00 },
-    Y: { TAT: 0.57, TAC: 0.43 },
-    V: { GTT: 0.28, GTC: 0.20, GTA: 0.17, GTG: 0.35 },
-    "*": { TAA: 0.61, TAG: 0.09, TGA: 0.30 },
-  },
-  "S. cerevisiae": {
-    A: { GCT: 0.38, GCC: 0.22, GCA: 0.29, GCG: 0.11 },
-    R: { AGA: 0.48, AGG: 0.21, CGA: 0.07, CGT: 0.14, CGC: 0.06, CGG: 0.04 },
-    N: { AAT: 0.59, AAC: 0.41 },
-    D: { GAT: 0.65, GAC: 0.35 },
-    C: { TGT: 0.63, TGC: 0.37 },
-    Q: { CAA: 0.69, CAG: 0.31 },
-    E: { GAA: 0.70, GAG: 0.30 },
-    G: { GGT: 0.47, GGC: 0.19, GGA: 0.22, GGG: 0.12 },
-    H: { CAT: 0.64, CAC: 0.36 },
-    I: { ATT: 0.46, ATC: 0.26, ATA: 0.27 },
-    L: { TTG: 0.28, TTA: 0.28, CTT: 0.13, CTC: 0.06, CTA: 0.14, CTG: 0.11 },
-    K: { AAA: 0.58, AAG: 0.42 },
-    M: { ATG: 1.00 },
-    F: { TTT: 0.59, TTC: 0.41 },
-    P: { CCT: 0.31, CCC: 0.15, CCA: 0.42, CCG: 0.12 },
-    S: { TCT: 0.26, TCC: 0.16, TCA: 0.21, TCG: 0.10, AGT: 0.16, AGC: 0.11 },
-    T: { ACT: 0.35, ACC: 0.22, ACA: 0.30, ACG: 0.14 },
-    W: { TGG: 1.00 },
-    Y: { TAT: 0.56, TAC: 0.44 },
-    V: { GTT: 0.39, GTC: 0.21, GTA: 0.21, GTG: 0.19 },
-    "*": { TAA: 0.48, TAG: 0.24, TGA: 0.29 },
-  },
-  "H. sapiens": {
-    A: { GCC: 0.40, GCT: 0.26, GCA: 0.23, GCG: 0.11 },
-    R: { CGC: 0.18, CGT: 0.08, AGA: 0.20, AGG: 0.20, CGA: 0.11, CGG: 0.21 },
-    N: { AAC: 0.54, AAT: 0.46 },
-    D: { GAC: 0.54, GAT: 0.46 },
-    C: { TGC: 0.55, TGT: 0.45 },
-    Q: { CAG: 0.73, CAA: 0.27 },
-    E: { GAG: 0.58, GAA: 0.42 },
-    G: { GGC: 0.34, GGG: 0.25, GGA: 0.25, GGT: 0.16 },
-    H: { CAC: 0.58, CAT: 0.42 },
-    I: { ATC: 0.48, ATT: 0.36, ATA: 0.16 },
-    L: { CTG: 0.41, CTC: 0.20, TTG: 0.13, CTT: 0.13, TTA: 0.07, CTA: 0.07 },
-    K: { AAG: 0.58, AAA: 0.42 },
-    M: { ATG: 1.00 },
-    F: { TTC: 0.55, TTT: 0.45 },
-    P: { CCC: 0.33, CCT: 0.28, CCA: 0.27, CCG: 0.11 },
-    S: { AGC: 0.24, TCC: 0.22, TCT: 0.18, TCA: 0.15, AGT: 0.15, TCG: 0.06 },
-    T: { ACC: 0.36, ACA: 0.28, ACT: 0.24, ACG: 0.12 },
-    W: { TGG: 1.00 },
-    Y: { TAC: 0.56, TAT: 0.44 },
-    V: { GTG: 0.47, GTC: 0.24, GTT: 0.18, GTA: 0.11 },
-    "*": { TGA: 0.52, TAA: 0.30, TAG: 0.18 },
-  },
-};
+import { CODON_TABLES, HOST_TO_TABLE } from "./codonTables";
+
+// Standard genetic code
 
 // Standard genetic code
 const GENETIC_CODE: Record<string, string> = {
@@ -136,6 +66,7 @@ interface OptimizationParams {
   codonTable?: CodonTable;
   avoidEnzymes?: string[];
   retainEnzymes?: string[];
+  sourceDnaSequence?: string;
   targetGcMin?: number;
   targetGcMax?: number;
   eliminateRepeats?: boolean;
@@ -234,7 +165,7 @@ function normalizeCodonTable(input: unknown): CodonTable {
 
 function resolveCodonTable(hostSpecies: string, codonTable?: CodonTable): CodonTable {
   if (codonTable) return normalizeCodonTable(codonTable);
-  const builtIn = CODON_TABLES[hostSpecies];
+  const builtIn = CODON_TABLES[hostSpecies] ?? CODON_TABLES[HOST_TO_TABLE[hostSpecies]];
   if (!builtIn) {
     throw new Error(`宿主 ${hostSpecies} 缺少密码子偏好表，请先在宿主管理中维护 codon table`);
   }
@@ -302,6 +233,93 @@ function calculateCAI(sequence: string, codonTable: Record<string, Record<string
  */
 function containsEnzymeSite(sequence: string, enzymeSite: string): boolean {
   return sequence.toUpperCase().includes(enzymeSite.toUpperCase());
+}
+
+export function normalizeRestrictionSites(sites: string[] = []): string[] {
+  return Array.from(
+    new Set(
+      sites
+        .map((site) => site.toUpperCase().replace(/\s/g, "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+export function countRestrictionSiteOccurrences(sequence: string, enzymeSite: string): number {
+  const cleanSequence = sequence.toUpperCase().replace(/\s/g, "");
+  const cleanSite = enzymeSite.toUpperCase().replace(/\s/g, "").trim();
+  if (!cleanSequence || !cleanSite) return 0;
+
+  let count = 0;
+  let searchFrom = 0;
+  while (searchFrom <= cleanSequence.length - cleanSite.length) {
+    const foundAt = cleanSequence.indexOf(cleanSite, searchFrom);
+    if (foundAt === -1) break;
+    count += 1;
+    searchFrom = foundAt + 1;
+  }
+  return count;
+}
+
+export type RetainConstraint = {
+  normalizedSites: string[];
+  protectedCodonIndexes: number[];
+  missingSites: string[];
+  expectedSiteCounts: Record<string, number>;
+};
+
+export function buildRetainConstraint(sourceDnaSequence: string, retainEnzymes: string[] = []): RetainConstraint {
+  const cleanSource = sourceDnaSequence.toUpperCase().replace(/\s/g, "");
+  const normalizedSites = normalizeRestrictionSites(retainEnzymes);
+  const protectedCodonIndexes = new Set<number>();
+  const expectedSiteCounts: Record<string, number> = {};
+  const missingSites: string[] = [];
+
+  for (const site of normalizedSites) {
+    let found = 0;
+    let searchFrom = 0;
+    while (searchFrom <= cleanSource.length - site.length) {
+      const foundAt = cleanSource.indexOf(site, searchFrom);
+      if (foundAt === -1) break;
+      found += 1;
+      const codonStart = Math.floor(foundAt / 3);
+      const codonEnd = Math.floor((foundAt + site.length - 1) / 3);
+      for (let codonIndex = codonStart; codonIndex <= codonEnd; codonIndex += 1) {
+        protectedCodonIndexes.add(codonIndex);
+      }
+      searchFrom = foundAt + 1;
+    }
+
+    expectedSiteCounts[site] = found;
+    if (found === 0) {
+      missingSites.push(site);
+    }
+  }
+
+  return {
+    normalizedSites,
+    protectedCodonIndexes: Array.from(protectedCodonIndexes).sort((a, b) => a - b),
+    missingSites,
+    expectedSiteCounts,
+  };
+}
+
+export function restoreProtectedCodons(
+  sourceDnaSequence: string,
+  candidateSequence: string,
+  protectedCodonIndexes: number[]
+): string {
+  const source = sourceDnaSequence.toUpperCase().replace(/\s/g, "");
+  const candidate = candidateSequence.toUpperCase().replace(/\s/g, "");
+  let restored = candidate;
+
+  for (const codonIndex of protectedCodonIndexes) {
+    const start = codonIndex * 3;
+    if (start + 3 > source.length || start + 3 > restored.length) continue;
+    restored = restored.slice(0, start) + source.slice(start, start + 3) + restored.slice(start + 3);
+  }
+
+  return restored;
 }
 
 /**
@@ -420,6 +438,10 @@ function getCodonWeight(
   return codonTable[aa][codon] || 0;
 }
 
+function codonMatchesAminoAcid(codon: string, aa: string): boolean {
+  return GENETIC_CODE[codon.toUpperCase()] === aa;
+}
+
 function canUseCodon(
   codon: string,
   currentSequence: string,
@@ -509,13 +531,14 @@ function enforceMinimumCAI(
   protein: string,
   codonTable: Record<string, Record<string, number>>,
   avoidSites: string[] = [],
-  targetGC?: { min: number; max: number }
+  targetGC?: { min: number; max: number },
+  protectedCodonIndexes: Set<number> = new Set()
 ): string {
   let best = optimizedSequence.toUpperCase();
   let bestCai = calculateCAI(best, codonTable);
   if (bestCai >= MIN_ACCEPTABLE_CAI) return best;
   const positions = Array.from({ length: protein.length }, (_, i) => i)
-    .filter(i => protein[i] !== "*" && !!codonTable[protein[i]])
+    .filter(i => protein[i] !== "*" && !!codonTable[protein[i]] && !protectedCodonIndexes.has(i))
     .sort((a, b) => {
       const codonA = best.slice(a * 3, a * 3 + 3);
       const codonB = best.slice(b * 3, b * 3 + 3);
@@ -548,15 +571,46 @@ function enforceMinimumCAI(
 }
 
 /**
+ * Try to raise the CAI of an already-optimized DNA sequence to the minimum
+ * acceptable threshold by swapping in higher-frequency synonymous codons.
+ * Protected codons are never touched, and avoid-enzyme / GC constraints are
+ * respected. Returns the (possibly unchanged) sequence — it never lowers CAI.
+ */
+export function raiseCaiAboveThreshold(
+  dnaSequence: string,
+  params: {
+    hostSpecies: string;
+    codonTable?: CodonTable;
+    avoidEnzymes?: string[];
+    targetGcMin?: number;
+    targetGcMax?: number;
+    protectedCodonIndexes?: number[];
+  }
+): string {
+  const codonTable = resolveCodonTable(params.hostSpecies, params.codonTable);
+  const clean = dnaSequence.toUpperCase().replace(/\s/g, "");
+  const protein = translateDNA(clean);
+  const targetGC =
+    params.targetGcMin !== undefined && params.targetGcMax !== undefined
+      ? { min: params.targetGcMin, max: params.targetGcMax }
+      : undefined;
+  const protectedCodonIndexes = new Set(params.protectedCodonIndexes ?? []);
+  return enforceMinimumCAI(clean, protein, codonTable, params.avoidEnzymes ?? [], targetGC, protectedCodonIndexes);
+}
+
+/**
  * Optimize DNA sequence for expression in a specific host
  */
 export function optimizeSequence(
   dnaSequence: string,
   params: OptimizationParams
 ): OptimizationResult {
-  const { hostSpecies, avoidEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const { hostSpecies, avoidEnzymes = [], retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
   
   const codonTable = resolveCodonTable(hostSpecies, params.codonTable);
+  const sourceDnaSequence = (params.sourceDnaSequence ?? dnaSequence).toUpperCase().replace(/\s/g, "");
+  const retainConstraint = buildRetainConstraint(sourceDnaSequence, retainEnzymes);
+  const protectedCodonIndexes = new Set(retainConstraint.protectedCodonIndexes);
   
   // Translate original sequence
   const protein = translateDNA(dnaSequence);
@@ -572,15 +626,22 @@ export function optimizeSequence(
   
   for (let i = 0; i < protein.length; i++) {
     const aa = protein[i];
+    const sourceCodon = sourceDnaSequence.substring(i * 3, i * 3 + 3).toUpperCase();
     
     if (aa === "*") {
-      // Keep stop codon
-      optimized += "TAA"; // Most common stop codon
+      if (protectedCodonIndexes.has(i) && sourceCodon.length === 3 && codonMatchesAminoAcid(sourceCodon, aa)) {
+        optimized += sourceCodon;
+      } else {
+        optimized += "TAA"; // Most common stop codon
+      }
       continue;
     }
     
     const originalCodon = dnaSequence.substring(i * 3, i * 3 + 3).toUpperCase();
-    const newCodon = selectCodon(aa, codonTable, avoidEnzymes, optimized, targetGC, i);
+    const newCodon =
+      protectedCodonIndexes.has(i) && sourceCodon.length === 3 && codonMatchesAminoAcid(sourceCodon, aa)
+        ? sourceCodon
+        : selectCodon(aa, codonTable, avoidEnzymes, optimized, targetGC, i);
     
     if (newCodon !== originalCodon) {
       changes++;
@@ -595,8 +656,23 @@ export function optimizeSequence(
       warnings.push(`警告: 优化后的序列仍包含限制性酶切位点 ${enzyme}`);
     }
   }
+
+  for (const site of retainConstraint.missingSites) {
+    warnings.push(`警告: 原始DNA序列中未找到需要保留的酶切位点 ${site}，已忽略该约束`);
+  }
   
-  optimized = enforceMinimumCAI(optimized, protein, codonTable, avoidEnzymes, targetGC);
+  optimized = enforceMinimumCAI(optimized, protein, codonTable, avoidEnzymes, targetGC, protectedCodonIndexes);
+  optimized = restoreProtectedCodons(sourceDnaSequence, optimized, retainConstraint.protectedCodonIndexes);
+
+  for (const site of retainConstraint.normalizedSites) {
+    const expectedCount = retainConstraint.expectedSiteCounts[site] ?? 0;
+    if (expectedCount === 0) continue;
+    const actualCount = countRestrictionSiteOccurrences(optimized, site);
+    if (actualCount < expectedCount) {
+      warnings.push(`警告: 需要保留的酶切位点 ${site} 未被完整保留（原始 ${expectedCount} 处，当前 ${actualCount} 处）`);
+    }
+  }
+
   const cai = calculateCAI(optimized, codonTable);
   const gcContent = calculateGC(optimized);
   const repeatStats = analyzeRepeatStats(optimized);
@@ -634,7 +710,7 @@ export function optimizeProteinSequence(
   proteinSequence: string,
   params: OptimizationParams
 ): OptimizationResult {
-  const { hostSpecies, avoidEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const { hostSpecies, avoidEnzymes = [], retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
 
   const codonTable = resolveCodonTable(hostSpecies, params.codonTable);
 
@@ -645,6 +721,10 @@ export function optimizeProteinSequence(
 
   let optimized = "";
   const warnings: string[] = [];
+
+  if (retainEnzymes.length > 0) {
+    warnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略“需要保留的酶切位点”约束");
+  }
 
   const targetGC = (targetGcMin !== undefined && targetGcMax !== undefined)
     ? { min: targetGcMin, max: targetGcMax }
@@ -722,7 +802,7 @@ export function optimizeSequenceAuto(
  * Get available host species
  */
 export function getAvailableHosts(): string[] {
-  return Object.keys(CODON_TABLES);
+  return Object.keys(HOST_TO_TABLE);
 }
 
 export function scoreDnaSequence(

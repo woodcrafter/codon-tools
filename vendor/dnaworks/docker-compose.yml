@@ -1,0 +1,9 @@
+services:
+  dnaworks-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dnaworks-web:latest
+    ports:
+      - "8080:8080"
+    restart: unless-stopped

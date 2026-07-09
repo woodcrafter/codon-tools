@@ -11,8 +11,10 @@ import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
+import { initDb } from "../db";
+import { seedDatabaseIfEmpty } from "../seed";
 
-function loadEnv() {
+export function loadEnv() {
   const here = path.dirname(fileURLToPath(import.meta.url));
 
   const candidates = [
@@ -33,11 +35,7 @@ function loadEnv() {
   return null;
 }
 
-const _envPath = loadEnv();
-
-if (!process.env.DATABASE_URL) {
-  console.warn(`[Env] DATABASE_URL is missing (loadedFrom=${_envPath ?? "none"})`);
-}
+loadEnv();
 
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise(resolve => {
@@ -58,7 +56,7 @@ async function findAvailablePort(startPort: number = 3000): Promise<number> {
   throw new Error(`No available port found starting from ${startPort}`);
 }
 
-async function startServer() {
+export async function startServer(): Promise<{ port: number }> {
   const app = express();
   const server = createServer(app);
   app.use(express.json({ limit: "50mb" }));
@@ -123,9 +121,21 @@ async function startServer() {
     console.log(`Port ${preferredPort} is busy, using port ${port} instead`);
   }
 
-  server.listen(port, () => {
-    console.log(`Server running on http://localhost:${port}/`);
+  return new Promise<{ port: number }>((resolve) => {
+    server.listen(port, async () => {
+      console.log(`Server running on http://localhost:${port}/`);
+      // Initialize the embedded database (schema bootstrap) and seed defaults.
+      await initDb();
+      await seedDatabaseIfEmpty();
+      resolve({ port });
+    });
   });
 }
 
-startServer().catch(console.error);
+// Auto-start when run directly (`node dist/index.js` or `tsx`), but NOT when the
+// module is imported by the Electron main process — that starts the server
+// explicitly after configuring the embedded database's data directory. Starting
+// twice would make two PGlite instances contend for the same data dir lock.
+if (!process.versions.electron) {
+  startServer().catch(console.error);
+}

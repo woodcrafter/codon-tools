@@ -1,0 +1,48 @@
+appId: com.example.protein-production-platform
+productName: 密码子优化与引物合成
+electronDownload:
+  mirror: https://npmmirror.com/mirrors/electron/
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/public/**/*
+  - dist-electron/**/*
+  - drizzle/**/*
+  - package.json
+  - .env
+  - .env.example
+  - "!node_modules/vite"
+  - "!node_modules/rollup"
+  - "!node_modules/@rollup"
+  - "!node_modules/@vitejs"
+  - "!node_modules/@builder.io"
+  - "!node_modules/@tailwindcss"
+extraResources:
+  - from: drizzle
+    to: drizzle
+  - from: bin
+    to: bin
+asar: true
+asarUnpack:
+  - "**/*.node"
+  - "**/*.wasm"
+  - "node_modules/@electric-sql/pglite/**"
+npmRebuild: false
+mac:
+  category: public.app-category.science
+  target:
+    - target: dmg
+      arch:
+        - arm64
+win:
+  signAndEditExecutable: false
+  target:
+    - target: portable
+      arch:
+        - x64
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64

@@ -521,10 +521,6 @@ export default function CodonOptimizationPage() {
     }
   };
 
-  const handleDirectToPlasmidSettings = () => {
-    toast.info("当前项目不保留质粒设置功能");
-  };
-
   return (
     <div className="container mx-auto py-8">
       <div className="mb-6">
@@ -748,9 +744,6 @@ export default function CodonOptimizationPage() {
           <div className="flex justify-end gap-2">
             <Button variant="outline" onClick={() => handleClearTable()}>
               重置
-            </Button>
-            <Button variant="outline" onClick={handleDirectToPlasmidSettings}>
-              直接质粒设置
             </Button>
             <Button
               onClick={handleOptimize}

@@ -5,38 +5,25 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
 import { toast } from "sonner";
-import { format } from "date-fns";
 import * as XLSX from "xlsx";
 import {
-  ChevronDown,
   Download,
   Loader2,
   Upload,
   Trash2,
   FileSpreadsheet,
-  Check,
   Copy,
+  Eye,
 } from "lucide-react";
 
 type Row = {
   id: number;
   geneName: string;
-  leftArm: string;
   sequence: string;
-  rightArm: string;
 };
 
-type Field = "geneName" | "leftArm" | "sequence" | "rightArm";
+type Field = "geneName" | "sequence";
 
 type FillState = {
   field: Field;
@@ -66,7 +53,7 @@ function normalizeSeq(v: unknown) {
 }
 
 function createEmptyRow(id: number): Row {
-  return { id, geneName: "", leftArm: "", sequence: "", rightArm: "" };
+  return { id, geneName: "", sequence: "" };
 }
 
 async function readXlsx(file: File): Promise<Record<string, any>[]> {
@@ -80,9 +67,7 @@ async function readXlsx(file: File): Promise<Record<string, any>[]> {
 function downloadTemplate() {
   const rows = Array.from({ length: 10 }).map((_, i) => ({
     基因名: "",
-    左重组臂: "",
     碱基序列: "",
-    右重组臂: "",
   }));
   const ws = XLSX.utils.json_to_sheet(rows);
   const wb = XLSX.utils.book_new();
@@ -124,15 +109,8 @@ function getClipboardText(e: React.ClipboardEvent<HTMLInputElement>) {
 
 function normalizeClipboardColumns(cells: string[]) {
   const cols = [...cells];
-  if (cols.length >= 5 && /^\d+$/.test(cols[0] || "")) cols.shift();
+  if (cols.length >= 3 && /^\d+$/.test(cols[0] || "")) cols.shift();
   return cols;
-}
-
-function formatDateTime(value: any) {
-  if (!value) return "";
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return "";
-  return format(d, "yyyy-MM-dd HH:mm:ss");
 }
 
 export default function PrimerDesignPage() {
@@ -150,30 +128,25 @@ export default function PrimerDesignPage() {
   const [synthesisMinOverlap, setSynthesisMinOverlap] = useState("19");
 
   const [detail, setDetail] = useState<any | null>(null);
+  const [repeatDetail, setRepeatDetail] = useState<any | null>(null);
 
-  const recentOptimized = trpc.optimizationJobs.recentOptimizedResults.useQuery({ limit: 200 });
   const synthesisBatchDesign = trpc.primers.synthesisBatchDesign.useMutation();
+  const repeatAnalysisQuery = trpc.primers.analyzeRepeats.useQuery(
+    {
+      items: rows.map((row) => ({
+        rowId: row.id,
+        geneName: row.geneName.trim(),
+        sequence: normalizeSeq(row.sequence),
+      })),
+    },
+    {
+      enabled: rows.some((row) => normalizeSeq(row.sequence).length > 0),
+      refetchOnWindowFocus: false,
+    }
+  );
 
-  const fieldOrder: Field[] = ["geneName", "leftArm", "sequence", "rightArm"];
+  const fieldOrder: Field[] = ["geneName", "sequence"];
   const makeCellKey = (rowId: number, field: Field) => `${rowId}:${field}`;
-
-  const recentMap = useMemo(() => {
-    const map = new Map<string, { geneName: string; optimizedSequence: string; jobId: string; optimizedAt: any }>();
-    (recentOptimized.data ?? []).forEach((x: any, idx: number) => {
-      const key = `${x.jobId}__${x.geneName}__${idx}`;
-      map.set(key, x);
-    });
-    return map;
-  }, [recentOptimized.data]);
-
-  const recentOptions = useMemo(() => {
-    return (recentOptimized.data ?? []).map((x: any, idx: number) => ({
-      key: `${x.jobId}__${x.geneName}__${idx}`,
-      geneName: x.geneName,
-      label: `${x.jobId}  |  ${x.geneName}  |  ${formatDateTime(x.optimizedAt)}`,
-      valueForSearch: x.geneName,
-    }));
-  }, [recentOptimized.data]);
 
   const ensureRowCount = (targetRows: number) => {
     setRows(prev => {
@@ -316,19 +289,15 @@ export default function PrimerDesignPage() {
     const data = await readXlsx(file);
     const mapped = data.map((r, idx) => {
       const geneName = (r.基因名 ?? r.GeneName ?? r.geneName ?? "").toString().trim();
-      const leftArm = (r.左重组臂 ?? r.LeftArm ?? r.leftArm ?? "").toString();
       const sequence = (r.碱基序列 ?? r.Sequence ?? r.sequence ?? r.TargetSequence ?? r.TemplateOrTargetSequence ?? "").toString();
-      const rightArm = (r.右重组臂 ?? r.RightArm ?? r.rightArm ?? "").toString();
       return {
         id: idx + 1,
         geneName,
-        leftArm,
         sequence,
-        rightArm,
       } as Row;
     });
 
-    const nextRows = mapped.filter(r => r.geneName || r.sequence || r.leftArm || r.rightArm);
+    const nextRows = mapped.filter(r => r.geneName || r.sequence);
     const padded = [
       ...nextRows,
       ...Array.from({ length: Math.max(0, 10 - nextRows.length) }, (_, i) => createEmptyRow(nextRows.length + i + 1)),
@@ -337,40 +306,120 @@ export default function PrimerDesignPage() {
     toast.success("已导入", { description: `共 ${nextRows.length} 条` });
   };
 
-  const handlePickOptimized = (rowId: number, key: string) => {
-    const picked = recentMap.get(key);
-    if (!picked) return;
-    setRows(prev =>
-      prev.map(r =>
-        r.id === rowId
-          ? { ...r, geneName: picked.geneName, sequence: picked.optimizedSequence }
-          : r
-      )
-    );
-  };
-
   const validItems = useMemo(() => {
     return rows
       .map(r => ({
         geneName: r.geneName.trim(),
         sequence: normalizeSeq(r.sequence),
-        leftArm: normalizeSeq(r.leftArm),
-        rightArm: normalizeSeq(r.rightArm),
       }))
       .filter(r => r.geneName && r.sequence);
   }, [rows]);
 
   const results = (synthesisBatchDesign.data as any)?.results ?? null;
+  const repeatStatsByRowId = useMemo(() => {
+    const map = new Map<number, any>();
+    for (const item of repeatAnalysisQuery.data ?? []) {
+      map.set(item.rowId, item.repeatStats);
+    }
+    return map;
+  }, [repeatAnalysisQuery.data]);
+
+  const formatRepeatStats = (repeatStats?: any | null) => {
+    if (!repeatStats) return "—";
+    const total = Number(repeatStats.total ?? 0);
+    const direct = Number(repeatStats.direct ?? 0);
+    const inverted = Number(repeatStats.inverted ?? 0);
+    const palindromic = Number(repeatStats.palindromic ?? 0);
+    const minLength = Number(repeatStats.minLength ?? 9);
+    if (total <= 0) return `0（阈值 ${minLength} nt）`;
+    return `${total}（DR ${direct} / IR ${inverted} / PR ${palindromic}）`;
+  };
+
+  const getRepeatRangeLabel = (position: number, length: number) => {
+    const start = Number(position || 0);
+    const size = Number(length || 0);
+    if (start <= 0 || size <= 0) return "—";
+    return `${start}-${start + size - 1}`;
+  };
+
+  const getGroupedRepeatPairs = (repeatStats?: any | null) => {
+    const pairs = Array.isArray(repeatStats?.pairs) ? repeatStats.pairs : [];
+    const groups = new Map<string, any>();
+
+    for (const pair of pairs) {
+      const sequence1 = pair.sequence1 ?? "";
+      const sequence2 =
+        pair.type === "DR" || !pair.sequence2 || pair.sequence2 === pair.sequence1
+          ? sequence1
+          : pair.sequence2;
+      const key = [pair.type ?? "", pair.length ?? 0, sequence1, sequence2].join("::");
+      const existing = groups.get(key);
+      if (existing) {
+        if (!existing.position1List.includes(pair.position1)) existing.position1List.push(pair.position1);
+        if (!existing.position2List.includes(pair.position2)) existing.position2List.push(pair.position2);
+      } else {
+        groups.set(key, {
+          type: pair.type ?? "",
+          length: Number(pair.length ?? 0),
+          sequence1,
+          sequence2,
+          position1List: [pair.position1],
+          position2List: [pair.position2],
+        });
+      }
+    }
+
+    return Array.from(groups.values())
+      .map((group) => ({
+        ...group,
+        position1List: group.position1List.sort((a: number, b: number) => a - b),
+        position2List: group.position2List.sort((a: number, b: number) => a - b),
+      }))
+      .sort((a, b) => {
+        const firstPos1A = a.position1List[0] ?? 0;
+        const firstPos1B = b.position1List[0] ?? 0;
+        if (firstPos1A !== firstPos1B) return firstPos1A - firstPos1B;
+        const firstPos2A = a.position2List[0] ?? 0;
+        const firstPos2B = b.position2List[0] ?? 0;
+        if (firstPos2A !== firstPos2B) return firstPos2A - firstPos2B;
+        return b.length - a.length;
+      });
+  };
+
+  const formatRepeatRangeList = (positions: number[], length: number) => {
+    if (!Array.isArray(positions) || !positions.length) return "—";
+    return positions.map((position) => getRepeatRangeLabel(position, length)).join(", ");
+  };
+
+  const formatSequenceForView = (sequence?: string | null) => {
+    if (!sequence) return "—";
+    const clean = sequence.replace(/\s+/g, "");
+    return clean.replace(/(.{60})/g, "$1\n");
+  };
 
   const exportOligosRows = useMemo(() => {
     if (!results) return [];
     const rows: any[] = [];
-    for (const r of results) {
-      if (!r?.success) continue;
+    const blankRow = {
+      寡核苷酸序号: "",
+      序列: "",
+      方向: "",
+      起始位置: "",
+      结束位置: "",
+      长度: "",
+      与下一条重叠长度: "",
+      重叠区Tm: "",
+      自二聚评分: "",
+      发卡评分: "",
+      质量评分: "",
+      方案全局评分: "",
+    };
+
+    const successfulResults = results.filter((r: any) => r?.success);
+    successfulResults.forEach((r: any, resultIndex: number) => {
       const oligos = Array.isArray(r.synthesisOligos) ? r.synthesisOligos : [];
       for (const o of oligos) {
         rows.push({
-          基因名: r.geneName ?? "",
           寡核苷酸序号: `${r.geneName}-${o.index}`,
           序列: o.sequence ?? "",
           方向: o.strand === "forward" ? "正向" : "反向",
@@ -385,7 +434,10 @@ export default function PrimerDesignPage() {
           方案全局评分: r.synthesisMeta?.globalScore ?? "",
         });
       }
-    }
+      if (resultIndex < successfulResults.length - 1) {
+        rows.push({ ...blankRow });
+      }
+    });
     return rows;
   }, [results]);
 
@@ -417,11 +469,11 @@ export default function PrimerDesignPage() {
     }
     try {
       await synthesisBatchDesign.mutateAsync({
-        items: validItems.map(x => ({
+        items: validItems.map((x: { geneName: string; sequence: string }) => ({
           geneName: x.geneName,
           sequence: x.sequence,
-          leftArm: x.leftArm || null,
-          rightArm: x.rightArm || null,
+          leftArm: null,
+          rightArm: null,
         })),
         params: {
           synthesisOligoLength: oligoLen,
@@ -433,37 +485,6 @@ export default function PrimerDesignPage() {
       toast.error(e?.message ?? "引物设计失败");
     }
   };
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const params = new URLSearchParams(window.location.search);
-    const from = params.get("from");
-    const jobId = params.get("jobId");
-    if (from !== "optimization" || !jobId) return;
-    try {
-      const raw = sessionStorage.getItem(`primerSeed:${jobId}`);
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as { items?: Array<{ geneName: string; targetSequence: string }> };
-      const items = (parsed.items ?? []).filter(x => x.geneName && x.targetSequence);
-      if (items.length === 0) return;
-      const next = items.map((x, idx) => ({
-        id: idx + 1,
-        geneName: x.geneName,
-        leftArm: "",
-        sequence: normalizeSeq(x.targetSequence),
-        rightArm: "",
-      }));
-      const required = Math.max(10, next.length);
-      const padded = [
-        ...next,
-        ...Array.from({ length: required - next.length }, (_, i) => createEmptyRow(next.length + i + 1)),
-      ];
-      setRows(padded);
-      toast.success("已从优化结果导入", { description: `共 ${items.length} 条` });
-    } catch {
-      return;
-    }
-  }, []);
 
   return (
     <div className="space-y-6">
@@ -540,9 +561,9 @@ export default function PrimerDesignPage() {
                   <tr>
                     <th className="border p-2 text-sm font-medium w-12">#</th>
                     <th className="border p-2 text-sm font-medium min-w-[150px]">基因名</th>
-                    <th className="border p-2 text-sm font-medium min-w-[160px]">左重组臂</th>
                     <th className="border p-2 text-sm font-medium min-w-[300px]">碱基序列</th>
-                    <th className="border p-2 text-sm font-medium min-w-[160px] whitespace-nowrap">右重组臂</th>
+                    <th className="border p-2 text-sm font-medium min-w-[220px]">重复序列统计</th>
+                    <th className="border p-2 text-sm font-medium w-[100px]">详情</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -553,71 +574,21 @@ export default function PrimerDesignPage() {
                         className="border p-1 relative"
                         onMouseMove={(e) => handleFillHover(row.id, "geneName", e)}
                       >
-                        <div className="flex items-center gap-1">
-                          <Input
-                            ref={(el) => {
-                              inputRefs.current[makeCellKey(row.id, "geneName")] = el;
-                            }}
-                            value={row.geneName}
-                            onChange={(e) => setCellValue(row.id, "geneName", e.target.value)}
-                            onPaste={(e) => handleCellPaste(e, row.id, "geneName")}
-                            onFocus={() => setActiveCell({ rowId: row.id, field: "geneName" })}
-                            onKeyDown={(e) => handleCellKeyDown(e, row.id, "geneName")}
-                            className="border-0 focus-visible:ring-0 h-8"
-                          />
-                          <Popover>
-                            <PopoverTrigger asChild>
-                              <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" disabled={recentOptions.length === 0}>
-                                <ChevronDown className="h-4 w-4" />
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent className="w-[520px] p-0" align="start">
-                              <Command>
-                                <CommandInput placeholder="按基因名搜索（最近200条）" />
-                                <CommandList>
-                                  <CommandEmpty>未找到匹配记录</CommandEmpty>
-                                  <CommandGroup className="max-h-72 overflow-auto">
-                                    {recentOptions.map((opt) => (
-                                      <CommandItem
-                                        key={opt.key}
-                                        value={opt.valueForSearch}
-                                        onSelect={() => handlePickOptimized(row.id, opt.key)}
-                                      >
-                                        <span className="font-mono text-xs">{opt.label}</span>
-                                      </CommandItem>
-                                    ))}
-                                  </CommandGroup>
-                                </CommandList>
-                              </Command>
-                            </PopoverContent>
-                          </Popover>
-                        </div>
-                        <button
-                          type="button"
-                          className="absolute bottom-0.5 right-0.5 w-2.5 h-2.5 rounded-[2px] bg-primary/40 hover:bg-primary/70 cursor-ns-resize"
-                          onMouseDown={(e) => startFillDown(row.id, "geneName", row.geneName || "", e)}
-                          title="下拉填充"
-                        />
-                      </td>
-                      <td
-                        className="border p-1 relative"
-                        onMouseMove={(e) => handleFillHover(row.id, "leftArm", e)}
-                      >
                         <Input
                           ref={(el) => {
-                            inputRefs.current[makeCellKey(row.id, "leftArm")] = el;
+                            inputRefs.current[makeCellKey(row.id, "geneName")] = el;
                           }}
-                          value={row.leftArm}
-                          onChange={(e) => setCellValue(row.id, "leftArm", e.target.value)}
-                          onPaste={(e) => handleCellPaste(e, row.id, "leftArm")}
-                          onFocus={() => setActiveCell({ rowId: row.id, field: "leftArm" })}
-                          onKeyDown={(e) => handleCellKeyDown(e, row.id, "leftArm")}
+                          value={row.geneName}
+                          onChange={(e) => setCellValue(row.id, "geneName", e.target.value)}
+                          onPaste={(e) => handleCellPaste(e, row.id, "geneName")}
+                          onFocus={() => setActiveCell({ rowId: row.id, field: "geneName" })}
+                          onKeyDown={(e) => handleCellKeyDown(e, row.id, "geneName")}
                           className="border-0 focus-visible:ring-0 h-8"
                         />
                         <button
                           type="button"
                           className="absolute bottom-0.5 right-0.5 w-2.5 h-2.5 rounded-[2px] bg-primary/40 hover:bg-primary/70 cursor-ns-resize"
-                          onMouseDown={(e) => startFillDown(row.id, "leftArm", row.leftArm || "", e)}
+                          onMouseDown={(e) => startFillDown(row.id, "geneName", row.geneName || "", e)}
                           title="下拉填充"
                         />
                       </td>
@@ -643,27 +614,34 @@ export default function PrimerDesignPage() {
                           title="下拉填充"
                         />
                       </td>
-                      <td
-                        className="border p-1 relative"
-                        onMouseMove={(e) => handleFillHover(row.id, "rightArm", e)}
-                      >
-                        <Input
-                          ref={(el) => {
-                            inputRefs.current[makeCellKey(row.id, "rightArm")] = el;
-                          }}
-                          value={row.rightArm}
-                          onChange={(e) => setCellValue(row.id, "rightArm", e.target.value)}
-                          onPaste={(e) => handleCellPaste(e, row.id, "rightArm")}
-                          onFocus={() => setActiveCell({ rowId: row.id, field: "rightArm" })}
-                          onKeyDown={(e) => handleCellKeyDown(e, row.id, "rightArm")}
-                          className="border-0 focus-visible:ring-0 h-8"
-                        />
-                        <button
+                      <td className="border p-2 text-sm">
+                        {normalizeSeq(row.sequence)
+                          ? (repeatStatsByRowId.has(row.id)
+                              ? formatRepeatStats(repeatStatsByRowId.get(row.id))
+                              : repeatAnalysisQuery.isFetching
+                                ? "计算中..."
+                                : "—")
+                          : "—"}
+                      </td>
+                      <td className="border p-2 text-center">
+                        <Button
                           type="button"
-                          className="absolute bottom-0.5 right-0.5 w-2.5 h-2.5 rounded-[2px] bg-primary/40 hover:bg-primary/70 cursor-ns-resize"
-                          onMouseDown={(e) => startFillDown(row.id, "rightArm", row.rightArm || "", e)}
-                          title="下拉填充"
-                        />
+                          variant="outline"
+                          size="sm"
+                          className="h-8 gap-1"
+                          disabled={!normalizeSeq(row.sequence)}
+                          onClick={() =>
+                            setRepeatDetail({
+                              rowId: row.id,
+                              geneName: row.geneName || `第 ${row.id} 行`,
+                              sequence: normalizeSeq(row.sequence),
+                              repeatStats: repeatStatsByRowId.get(row.id) ?? null,
+                            })
+                          }
+                        >
+                          <Eye className="h-3.5 w-3.5" />
+                          查看
+                        </Button>
                       </td>
                     </tr>
                   ))}
@@ -674,7 +652,6 @@ export default function PrimerDesignPage() {
 
           <div className="flex items-center justify-between text-sm text-muted-foreground">
             <div>已填写 {validItems.length} 条</div>
-            {recentOptimized.isLoading ? <div>正在加载最近优化结果...</div> : null}
           </div>
         </CardContent>
       </Card>
@@ -790,6 +767,75 @@ export default function PrimerDesignPage() {
             </div>
           ) : (
             <div className="text-sm text-destructive">{detail?.error ?? "设计失败"}</div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(repeatDetail)} onOpenChange={(open) => !open && setRepeatDetail(null)}>
+        <DialogContent className="w-[95vw] sm:max-w-5xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>{repeatDetail?.geneName ?? ""} 重复序列详情</DialogTitle>
+          </DialogHeader>
+          {repeatDetail && (
+            <div className="space-y-4 text-sm">
+              <div className="grid grid-cols-2 gap-3">
+                <div className="rounded-xl border bg-muted/20 p-3">
+                  <p className="mb-1 text-xs font-medium text-muted-foreground">序列长度</p>
+                  <p className="text-base font-semibold">{repeatDetail.sequence?.length ?? 0} bp</p>
+                </div>
+                <div className="rounded-xl border bg-muted/20 p-3">
+                  <p className="mb-1 text-xs font-medium text-muted-foreground">重复序列统计</p>
+                  <p className="text-base font-semibold">{formatRepeatStats(repeatDetail.repeatStats)}</p>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">碱基序列</p>
+                <pre className="max-h-44 overflow-y-auto rounded-xl border bg-muted/30 p-3 text-xs leading-6 font-mono whitespace-pre-wrap break-words">
+                  {formatSequenceForView(repeatDetail.sequence)}
+                </pre>
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">重复序列明细</p>
+                {!getGroupedRepeatPairs(repeatDetail.repeatStats).length ? (
+                  <div className="rounded-xl border bg-muted/20 p-3 text-sm text-muted-foreground">
+                    未检测到达到阈值的重复序列
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto rounded-xl border">
+                    <table className="w-full min-w-[760px]">
+                      <thead className="bg-muted/60">
+                        <tr>
+                          <th className="border p-2 text-left text-xs font-medium">类型</th>
+                          <th className="border p-2 text-left text-xs font-medium">重复序列</th>
+                          <th className="border p-2 text-left text-xs font-medium">位置 1</th>
+                          <th className="border p-2 text-left text-xs font-medium">位置 2</th>
+                          <th className="border p-2 text-left text-xs font-medium">长度</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {getGroupedRepeatPairs(repeatDetail.repeatStats).map((group: any, index: number) => (
+                          <tr key={`${group.type}_${group.sequence1}_${group.length}_${index}`} className="hover:bg-muted/30">
+                            <td className="border p-2 text-xs font-medium">{group.type}</td>
+                            <td className="border p-2 text-xs font-mono break-all">
+                              {group.sequence1}
+                              {group.type !== "DR" && group.sequence2 && group.sequence2 !== group.sequence1 ? (
+                                <React.Fragment>
+                                  <span className="mx-1 text-muted-foreground">/</span>
+                                  {group.sequence2}
+                                </React.Fragment>
+                              ) : null}
+                            </td>
+                            <td className="border p-2 text-xs font-mono">{formatRepeatRangeList(group.position1List, group.length)}</td>
+                            <td className="border p-2 text-xs font-mono">{formatRepeatRangeList(group.position2List, group.length)}</td>
+                            <td className="border p-2 text-xs font-mono">{group.length} nt</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </div>
           )}
         </DialogContent>
       </Dialog>

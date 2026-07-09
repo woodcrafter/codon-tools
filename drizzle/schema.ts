@@ -1,5 +1,6 @@
 import {
   boolean,
+  integer,
   jsonb,
   pgEnum,
   pgTable,
@@ -20,6 +21,7 @@ export const hostSpecies = pgTable("host_species", {
   name: varchar("name", { length: 100 }).notNull().unique(),
   scientificName: varchar("scientificName", { length: 200 }),
   category: varchar("category", { length: 50 }),
+  sortOrder: integer("sortOrder").default(0).notNull(),
   codonTable: jsonb("codonTable"),
   isActive: boolean("isActive").default(true).notNull(),
   createdAt: timestamp("createdAt", { mode: "date" }).defaultNow().notNull(),
@@ -87,4 +89,3 @@ export const primerDesignRuns = pgTable("primer_design_runs", {
 
 export type PrimerDesignRun = typeof primerDesignRuns.$inferSelect;
 export type InsertPrimerDesignRun = typeof primerDesignRuns.$inferInsert;
-

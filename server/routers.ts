@@ -6,9 +6,9 @@ import * as db from "./db";
 import {
   analyzeCodonUsage,
   analyzeRepeatStats,
-  optimizeSequenceAuto,
   scoreDnaSequence,
 } from "./codonOptimization";
+import { optimizeByStrategy } from "./codonOptimizationStrategy";
 import {
   designPCRPrimers,
   designSequencingPrimers,
@@ -63,29 +63,33 @@ async function executeOptimizationBatchCompat(input: {
     ? await db.getHostSpeciesById(input.secondaryHostSpeciesId)
     : null;
 
-  const results = input.items.map((item, index) => {
-    const optimized = optimizeSequenceAuto(item.cdsSequence, {
-      hostSpecies: host.name,
-      codonTable: (host.codonTable ?? undefined) as any,
-      avoidEnzymes: input.avoidEnzymes,
-      eliminateRepeats: true,
-    });
+  const results = await Promise.all(
+    input.items.map(async (item, index) => {
+      const optimized = await optimizeByStrategy(item.cdsSequence, {
+        hostSpecies: host.name,
+        codonTable: (host.codonTable ?? undefined) as any,
+        avoidEnzymes: input.avoidEnzymes,
+        retainEnzymes: input.retainEnzymes,
+        eliminateRepeats: true,
+      });
 
-    return {
-      id: index + 1,
-      geneName: item.geneName,
-      avgGcContent: optimized.gcContent,
-      hostName: host.name,
-      secondaryHostName: secondaryHost?.name ?? null,
-      avoidEnzymesDisplay: (input.avoidEnzymes ?? []).join(", "),
-      originalSequence: item.cdsSequence,
-      optimizedSequence: optimized.optimizedSequence,
-      caiScore: optimized.cai,
-      fivePrimeFlank: item.fivePrimeFlank ?? "",
-      threePrimeFlank: item.threePrimeFlank ?? "",
-      warnings: optimized.warnings,
-    };
-  });
+      return {
+        id: index + 1,
+        geneName: item.geneName,
+        avgGcContent: optimized.gcContent,
+        hostName: host.name,
+        secondaryHostName: secondaryHost?.name ?? null,
+        avoidEnzymesDisplay: (input.avoidEnzymes ?? []).join(", "),
+        originalSequence: item.cdsSequence,
+        optimizedSequence: optimized.optimizedSequence,
+        caiScore: optimized.cai,
+        fivePrimeFlank: item.fivePrimeFlank ?? "",
+        threePrimeFlank: item.threePrimeFlank ?? "",
+        warnings: optimized.warnings,
+        repeatStats: optimized.repeatStats,
+      };
+    })
+  );
 
   await db.insertOptimizationRun({
     runId,
@@ -144,6 +148,16 @@ export const appRouter = router({
     list: publicProcedure.query(async () => {
       return db.listHostSpecies();
     }),
+    reorder: publicProcedure
+      .input(
+        z.object({
+          orderedIds: z.array(z.number()).min(1),
+        })
+      )
+      .mutation(async ({ input }) => {
+        await db.saveHostSpeciesOrder(input.orderedIds);
+        return { ok: true };
+      }),
     upsert: publicProcedure
       .input(
         z.object({
@@ -151,6 +165,7 @@ export const appRouter = router({
           name: nonEmptyText,
           scientificName: z.string().trim().optional().nullable(),
           category: z.string().trim().optional().nullable(),
+          sortOrder: z.number().optional().nullable(),
           codonTable: z.any().optional().nullable(),
           isActive: z.boolean().optional(),
         })
@@ -206,7 +221,7 @@ export const appRouter = router({
           const host = await db.getHostSpeciesById(input.hostSpeciesId);
           if (!host) throw new Error("宿主物种不存在");
 
-          const result = optimizeSequenceAuto(input.sequence, {
+          const result = await optimizeByStrategy(input.sequence, {
             hostSpecies: host.name,
             codonTable: (host.codonTable ?? undefined) as any,
             avoidEnzymes: input.avoidSites,
@@ -270,17 +285,19 @@ export const appRouter = router({
           const host = await db.getHostSpeciesById(input.hostSpeciesId);
           if (!host) throw new Error("宿主物种不存在");
 
-          const results = input.items.map(item => {
-            const output = optimizeSequenceAuto(item.sequence, {
-              hostSpecies: host.name,
-              codonTable: (host.codonTable ?? undefined) as any,
-              avoidEnzymes: input.avoidSites,
-              targetGcMin: input.targetGcMin,
-              targetGcMax: input.targetGcMax,
-              eliminateRepeats: input.eliminateRepeats,
-            });
-            return { geneName: item.geneName, inputSequence: item.sequence, ...output };
-          });
+          const results = await Promise.all(
+            input.items.map(async (item) => {
+              const output = await optimizeByStrategy(item.sequence, {
+                hostSpecies: host.name,
+                codonTable: (host.codonTable ?? undefined) as any,
+                avoidEnzymes: input.avoidSites,
+                targetGcMin: input.targetGcMin,
+                targetGcMax: input.targetGcMax,
+                eliminateRepeats: input.eliminateRepeats,
+              });
+              return { geneName: item.geneName, inputSequence: item.sequence, ...output };
+            })
+          );
 
           await db.insertOptimizationRun({
             runId,
@@ -383,6 +400,29 @@ export const appRouter = router({
       }),
   }),
   primers: router({
+    analyzeRepeats: publicProcedure
+      .input(
+        z.object({
+          items: z.array(
+            z.object({
+              rowId: z.number(),
+              geneName: z.string().optional(),
+              sequence: z.string().optional(),
+            })
+          ).max(1000),
+        })
+      )
+      .query(async ({ input }) => {
+        return input.items.map((item) => {
+          const sequence = normalizeDnaLike(item.sequence ?? "");
+          return {
+            rowId: item.rowId,
+            geneName: item.geneName ?? "",
+            sequence,
+            repeatStats: sequence ? analyzeRepeatStats(sequence) : null,
+          };
+        });
+      }),
     design: publicProcedure
       .input(
         z.object({

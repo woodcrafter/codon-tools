@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { GripVertical } from "lucide-react";
 
 type CodonRow = {
   id: string;
@@ -260,6 +261,9 @@ export default function HostSpeciesPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [form, setForm] = useState<HostFormState>(defaultFormState);
   const [tableError, setTableError] = useState<string | null>(null);
+  const [draggingHostId, setDraggingHostId] = useState<number | null>(null);
+  const [dropTargetHostId, setDropTargetHostId] = useState<number | null>(null);
+  const importInputRef = useRef<HTMLInputElement | null>(null);
 
   const upsert = trpc.hosts.upsert.useMutation({
     onSuccess: () => {
@@ -283,6 +287,16 @@ export default function HostSpeciesPage() {
       toast.error(error.message || "删除失败");
     },
   });
+
+  const reorder = trpc.hosts.reorder.useMutation({
+    onSuccess: () => {
+      hosts.refetch();
+    },
+    onError: (error) => {
+      toast.error(error.message || "排序保存失败");
+    },
+  });
+  const importHosts = trpc.hosts.upsert.useMutation();
 
   const openCreateDialog = () => {
     setForm(defaultFormState());
@@ -376,9 +390,98 @@ export default function HostSpeciesPage() {
       name: form.name.trim(),
       scientificName: form.scientificName.trim() || null,
       category: null,
+      sortOrder: null,
       isActive: true,
       codonTable: table,
     });
+  };
+
+  const handleDropHost = (targetHostId: number) => {
+    const list = hosts.data ?? [];
+    if (!draggingHostId || draggingHostId === targetHostId) {
+      setDraggingHostId(null);
+      setDropTargetHostId(null);
+      return;
+    }
+    const currentIndex = list.findIndex((host) => host.id === draggingHostId);
+    const targetIndex = list.findIndex((host) => host.id === targetHostId);
+    if (currentIndex < 0 || targetIndex < 0) return;
+
+    const reordered = [...list];
+    const [moved] = reordered.splice(currentIndex, 1);
+    reordered.splice(targetIndex, 0, moved);
+    reorder.mutate({
+      orderedIds: reordered.map((host) => host.id),
+    });
+    setDraggingHostId(null);
+    setDropTargetHostId(null);
+  };
+
+  const handleExportHosts = () => {
+    const list = hosts.data ?? [];
+    if (!list.length) {
+      toast.error("没有可导出的宿主物种数据");
+      return;
+    }
+
+    const payload = {
+      type: "host_species",
+      exportedAt: new Date().toISOString(),
+      items: list.map((host) => ({
+        name: host.name,
+        scientificName: host.scientificName ?? null,
+        category: host.category ?? null,
+        sortOrder: host.sortOrder ?? 0,
+        codonTable: host.codonTable ?? null,
+        isActive: host.isActive ?? true,
+      })),
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `host-species-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleImportHosts = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const items = Array.isArray(parsed) ? parsed : parsed?.items;
+      if (!Array.isArray(items) || items.length === 0) {
+        throw new Error("导入文件中未找到宿主物种数据");
+      }
+
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index] as Record<string, unknown>;
+        if (typeof item?.name !== "string" || !item.name.trim()) {
+          throw new Error(`第 ${index + 1} 条宿主物种缺少名称`);
+        }
+
+        await importHosts.mutateAsync({
+          name: item.name.trim(),
+          scientificName: typeof item.scientificName === "string" ? item.scientificName.trim() || null : null,
+          category: typeof item.category === "string" ? item.category.trim() || null : null,
+          sortOrder: Number.isFinite(item.sortOrder) ? Number(item.sortOrder) : index,
+          codonTable: item.codonTable ?? null,
+          isActive: typeof item.isActive === "boolean" ? item.isActive : true,
+        });
+      }
+
+      await hosts.refetch();
+      toast.success("宿主物种已批量导入", { description: `共 ${items.length} 条` });
+    } catch (error: any) {
+      toast.error(error?.message || "宿主物种导入失败");
+    }
   };
 
   return (
@@ -388,7 +491,22 @@ export default function HostSpeciesPage() {
           <h1 className="text-xl font-semibold">宿主物种</h1>
           <p className="text-sm text-muted-foreground mt-1">维护宿主基础信息与密码子偏好表。</p>
         </div>
-        <Button onClick={openCreateDialog}>新增宿主</Button>
+        <div className="flex items-center gap-2">
+          <input
+            ref={importInputRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={handleImportHosts}
+          />
+          <Button variant="outline" onClick={handleExportHosts} disabled={!hosts.data?.length}>
+            批量导出
+          </Button>
+          <Button variant="outline" onClick={() => importInputRef.current?.click()} disabled={importHosts.isPending}>
+            批量导入
+          </Button>
+          <Button onClick={openCreateDialog}>新增宿主</Button>
+        </div>
       </div>
 
       <Card>
@@ -397,17 +515,55 @@ export default function HostSpeciesPage() {
             <table className="w-full">
               <thead className="bg-muted">
                 <tr>
+                  <th className="border p-3 text-center text-sm font-medium w-[88px]">排序</th>
                   <th className="border p-3 text-left text-sm font-medium min-w-[160px]">名称</th>
                   <th className="border p-3 text-left text-sm font-medium min-w-[180px]">学名</th>
                   <th className="border p-3 text-left text-sm font-medium min-w-[160px]">密码子偏好表</th>
-                  <th className="border p-3 text-right text-sm font-medium w-[180px]">操作</th>
+                  <th className="border p-3 text-right text-sm font-medium w-[240px]">操作</th>
                 </tr>
               </thead>
               <tbody>
-                {(hosts.data ?? []).map(host => {
+                {(hosts.data ?? []).map((host, index) => {
                   const rowCount = getPopulatedRowCount(parseCodonTableToRows(host.codonTable));
                   return (
-                    <tr key={host.id} className="hover:bg-muted/50">
+                    <tr
+                      key={host.id}
+                      className={`hover:bg-muted/50 ${dropTargetHostId === host.id ? "bg-muted/40" : ""}`}
+                      onDragOver={(e) => {
+                        e.preventDefault();
+                        if (draggingHostId !== host.id) {
+                          setDropTargetHostId(host.id);
+                        }
+                      }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        handleDropHost(host.id);
+                      }}
+                      onDragEnd={() => {
+                        setDraggingHostId(null);
+                        setDropTargetHostId(null);
+                      }}
+                    >
+                      <td className="border p-3">
+                        <div className="flex items-center justify-center gap-2">
+                          <button
+                            type="button"
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-md border bg-background text-muted-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={reorder.isPending}
+                            draggable={!reorder.isPending}
+                            onDragStart={(e) => {
+                              setDraggingHostId(host.id);
+                              setDropTargetHostId(host.id);
+                              e.dataTransfer.effectAllowed = "move";
+                              e.dataTransfer.setData("text/plain", String(host.id));
+                            }}
+                            title="拖动排序"
+                          >
+                            <GripVertical className="h-4 w-4" />
+                          </button>
+                          <span className="text-sm text-muted-foreground tabular-nums">{index + 1}</span>
+                        </div>
+                      </td>
                       <td className="border p-3 text-sm font-medium">{host.name}</td>
                       <td className="border p-3 text-sm text-muted-foreground">{host.scientificName || "—"}</td>
                       <td className="border p-3 text-sm text-muted-foreground">
@@ -428,7 +584,7 @@ export default function HostSpeciesPage() {
                 })}
                 {hosts.data?.length === 0 ? (
                   <tr>
-                    <td colSpan={4} className="p-6 text-center text-sm text-muted-foreground">
+                    <td colSpan={5} className="p-6 text-center text-sm text-muted-foreground">
                       暂无宿主物种数据
                     </td>
                   </tr>

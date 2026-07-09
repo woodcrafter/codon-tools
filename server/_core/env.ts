@@ -1,10 +1,26 @@
 export const ENV = {
-  cookieSecret: process.env.JWT_SECRET ?? "",
-  databaseUrl: process.env.DATABASE_URL ?? "",
-  ownerOpenId: process.env.OWNER_OPEN_ID ?? "",
-  isProduction: process.env.NODE_ENV === "production",
-  forgeApiUrl: process.env.BUILT_IN_FORGE_API_URL ?? "",
-  forgeApiKey: process.env.BUILT_IN_FORGE_API_KEY ?? "",
-  dnaWorksExecutablePath: process.env.DNAWORKS_EXECUTABLE_PATH ?? "",
-  dnaWorksWorkdir: process.env.DNAWORKS_WORKDIR ?? "",
+  get cookieSecret() {
+    return process.env.JWT_SECRET ?? "";
+  },
+  get databaseUrl() {
+    return process.env.DATABASE_URL ?? "";
+  },
+  get ownerOpenId() {
+    return process.env.OWNER_OPEN_ID ?? "";
+  },
+  get isProduction() {
+    return process.env.NODE_ENV === "production";
+  },
+  get forgeApiUrl() {
+    return process.env.BUILT_IN_FORGE_API_URL ?? "";
+  },
+  get forgeApiKey() {
+    return process.env.BUILT_IN_FORGE_API_KEY ?? "";
+  },
+  get dnaWorksExecutablePath() {
+    return process.env.DNAWORKS_EXECUTABLE_PATH ?? "";
+  },
+  get dnaWorksWorkdir() {
+    return process.env.DNAWORKS_WORKDIR ?? "";
+  },
 };
