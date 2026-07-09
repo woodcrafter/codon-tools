@@ -103,7 +103,7 @@ jobs:
         run: |
           cd vendor/dnaworks
           mingw32-make clean
-          mingw32-make FC=x86_64-w64-mingw32-gfortran
+          mingw32-make FC=x86_64-w64-mingw32-gfortran FCFLAGS="-g -fbounds-check -O2 -static-libgfortran -static-libgcc" FLFLAGS="-g -static-libgfortran -static-libgcc"
           mkdir -p ../../bin
           cp dnaworks.exe ../../bin/dnaworks-win.exe
           ls -la ../../bin/dnaworks-win.exe
