@@ -133,6 +133,23 @@ export default function CodonOptimizationPage() {
     },
   });
 
+  const deleteJobMutation = trpc.history.delete.useMutation({
+    onSuccess: () => {
+      toast.success("已删除该优化记录");
+      refetchJobs();
+    },
+    onError: (error) => {
+      toast.error("删除失败", { description: error.message });
+    },
+  });
+
+  const handleDeleteJob = (e: React.MouseEvent, jobId: string) => {
+    e.stopPropagation();
+    if (deleteJobMutation.isPending) return;
+    if (!window.confirm(`确认删除优化记录 ${jobId}？此操作不可撤销。`)) return;
+    deleteJobMutation.mutate({ type: "optimization", runId: jobId });
+  };
+
   const detectSequenceType = (sequence: string): "dna" | "protein" => {
     const cleanSeq = (sequence || "").toUpperCase().replace(/\s/g, "");
     if (!cleanSeq) return "dna";
@@ -799,12 +816,13 @@ export default function CodonOptimizationPage() {
                       <th className="border px-2 py-2 text-sm w-20">数量</th>
                       <th className="border px-2 py-2 text-sm w-20">状态</th>
                       <th className="border px-2 py-2 text-sm min-w-[180px]">提交时间</th>
+                      <th className="border px-2 py-2 text-sm w-20">操作</th>
                     </tr>
                   </thead>
                   <tbody>
                     {pagedJobs.length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="border px-3 py-6 text-center text-sm text-muted-foreground">
+                        <td colSpan={7} className="border px-3 py-6 text-center text-sm text-muted-foreground">
                           未找到匹配的优化记录
                         </td>
                       </tr>
@@ -822,6 +840,19 @@ export default function CodonOptimizationPage() {
                           <td className="border px-2 py-2 text-sm text-center">完成</td>
                           <td className="border px-2 py-2 text-sm text-center">
                             {job.createdAt ? new Date(job.createdAt).toLocaleString("zh-CN", { hour12: false }) : "—"}
+                          </td>
+                          <td className="border px-2 py-2 text-center">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-7 w-7 text-destructive hover:text-destructive"
+                              title="删除该优化记录"
+                              disabled={deleteJobMutation.isPending}
+                              onClick={(e) => handleDeleteJob(e, job.jobId)}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
                           </td>
                         </tr>
                       ))
