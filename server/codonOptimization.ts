@@ -163,7 +163,7 @@ function normalizeCodonTable(input: unknown): CodonTable {
   return normalized;
 }
 
-function resolveCodonTable(hostSpecies: string, codonTable?: CodonTable): CodonTable {
+export function resolveCodonTable(hostSpecies: string, codonTable?: CodonTable): CodonTable {
   if (codonTable) return normalizeCodonTable(codonTable);
   const builtIn = CODON_TABLES[hostSpecies] ?? CODON_TABLES[HOST_TO_TABLE[hostSpecies]];
   if (!builtIn) {

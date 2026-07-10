@@ -11,6 +11,7 @@ import {
   optimizeSequence,
   optimizeSequenceAuto,
   raiseCaiAboveThreshold,
+  resolveCodonTable,
   restoreProtectedCodons,
   scoreDnaSequence,
   type CodonTable,
@@ -18,7 +19,7 @@ import {
 } from "./codonOptimization";
 import { ENV } from "./_core/env";
 
-export const optimizationStrategies = ["dnaworks"] as const;
+export const optimizationStrategies = ["dnaworks", "js"] as const;
 export type OptimizationStrategy = (typeof optimizationStrategies)[number];
 
 const MIN_ACCEPTABLE_CAI = 0.8;
@@ -281,7 +282,14 @@ function runExecFile(command: string, args: string[], cwd: string): Promise<{ st
   return new Promise((resolve, reject) => {
     execFile(command, args, { cwd }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(stderr?.trim() || error.message));
+        const detail = [
+          `Command: ${command} ${args.join(" ")}`,
+          `CWD: ${cwd}`,
+          `Exit code: ${(error as NodeJS.ErrnoException).code || "unknown"}`,
+          `Error: ${error.message}`,
+          stderr?.trim() ? `Stderr: ${stderr.trim()}` : "Stderr: (empty)",
+        ].join("\n");
+        reject(new Error(detail));
         return;
       }
       resolve({ stdout: stdout ?? "", stderr: stderr ?? "" });
@@ -341,6 +349,132 @@ function buildInputTemplate(sequence: string): string {
   ].join("\n");
 }
 
+// One-letter -> DNAWorks three-letter amino acid code. Stop codons map to "End"
+// and are written as the residue "X" in the PROTEIN block (see DNAWorks input.f90).
+const AA1_TO_AA3: Record<string, string> = {
+  A: "Ala", R: "Arg", N: "Asn", D: "Asp", C: "Cys", Q: "Gln", E: "Glu", G: "Gly",
+  H: "His", I: "Ile", L: "Leu", K: "Lys", M: "Met", F: "Phe", P: "Pro", S: "Ser",
+  T: "Thr", W: "Trp", Y: "Tyr", V: "Val", "*": "End",
+};
+
+// Emits a DNAWorks custom codon-frequency block (GCG-style, 5 columns per line:
+// AA3 codon count perThousand fraction). DNAWorks reads columns 1, 2 and 5, uses
+// the fraction (0-1) for codon selection, and requires all 64 codons to be
+// present with a non-zero frequency, so absent/zero entries are floored.
+function buildCodonBlock(table: CodonTable): string {
+  const lines = ["CODON"];
+  for (const [codon, aa1] of Object.entries(GENETIC_CODE)) {
+    const aa3 = AA1_TO_AA3[aa1];
+    if (!aa3) continue;
+    const raw = table[aa1]?.[codon] ?? 0;
+    const fraction = Math.max(raw, 0.001);
+    const count = Math.max(1, Math.round(fraction * 1000));
+    lines.push(`${aa3}\t${codon}\t${count}\t0.00\t${fraction.toFixed(3)}`);
+  }
+  lines.push("//");
+  return lines.join("\n");
+}
+
+// Feeds DNAWorks the PROTEIN sequence plus the host codon table, letting it pick
+// synonymous codons itself. Unlike a fixed NUCLEOTIDE input this preserves codon
+// degeneracy, so DNAWorks can break up repeats and resolve misprimes.
+function buildProteinInputTemplate(protein: string, table: CodonTable): string {
+  const residues = protein.toUpperCase().replace(/[^ACDEFGHIKLMNPQRSTVWY*]/g, "").replace(/\*/g, "X");
+  return [
+    'title "CODON_TOOLS_DNAWORKS"',
+    'logfile "LOGFILE.txt"',
+    "timelimit 30",
+    "solutions 1",
+    // Lower than DNAWorks' 50% default so more synonymous codons stay active,
+    // giving it the degeneracy it needs to break up repeats and avoid misprimes.
+    "frequency threshold 10",
+    buildCodonBlock(table),
+    "PROTEIN",
+    wrapSequence(residues),
+    "//",
+    "",
+  ].join("\n");
+}
+
+async function runPureJS(sequence: string, params: OptimizeParams): Promise<OptimizeResult> {
+  const clean = sequence.toUpperCase().replace(/\s/g, "");
+  const isProtein = /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(clean);
+  const isDna = /^[ATCGN]+$/.test(clean);
+  if (!isProtein && !isDna) {
+    throw new Error("序列格式无效，必须是 DNA 或蛋白序列");
+  }
+
+  const effectiveParams = isDna ? { ...params, sourceDnaSequence: clean } : params;
+  const result = optimizeSequenceAuto(clean, effectiveParams);
+
+  const polished = polishRepeats(result.optimizedSequence, effectiveParams);
+  let finalSequence = polished.sequence;
+  const retainWarnings: string[] = [];
+  let protectedCodonIndexes: number[] = [];
+
+  if (isDna && effectiveParams.retainEnzymes?.length) {
+    const retainConstraint = buildRetainConstraint(clean, effectiveParams.retainEnzymes);
+    protectedCodonIndexes = retainConstraint.protectedCodonIndexes;
+    finalSequence = restoreProtectedCodons(clean, finalSequence, protectedCodonIndexes);
+    for (const site of retainConstraint.missingSites) {
+      retainWarnings.push(`警告: 原始DNA序列中未找到需要保留的酶切位点 ${site}，已忽略该约束`);
+    }
+    for (const site of retainConstraint.normalizedSites) {
+      const expectedCount = retainConstraint.expectedSiteCounts[site] ?? 0;
+      if (expectedCount === 0) continue;
+      const actualCount = countRestrictionSiteOccurrences(finalSequence, site);
+      if (actualCount < expectedCount) {
+        retainWarnings.push(`警告: 需要保留的酶切位点 ${site} 未被完整保留（原始 ${expectedCount} 处，当前 ${actualCount} 处）`);
+      }
+    }
+  } else if (isProtein && effectiveParams.retainEnzymes?.length) {
+    retainWarnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略'需要保留的酶切位点'约束");
+  }
+
+  let optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
+  const caiWarnings: string[] = [];
+  if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
+    const lifted = raiseCaiAboveThreshold(finalSequence, {
+      hostSpecies: params.hostSpecies,
+      codonTable: params.codonTable,
+      avoidEnzymes: params.avoidEnzymes,
+      targetGcMin: params.targetGcMin,
+      targetGcMax: params.targetGcMax,
+      protectedCodonIndexes,
+    });
+    const liftedMetrics = scoreDnaSequence(lifted, params.hostSpecies, params.codonTable);
+    if (liftedMetrics.cai > optimizedMetrics.cai) {
+      caiWarnings.push(`CAI 自动拉升：${optimizedMetrics.cai.toFixed(3)} -> ${liftedMetrics.cai.toFixed(3)}`);
+      finalSequence = lifted;
+      optimizedMetrics = liftedMetrics;
+    }
+    if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
+      caiWarnings.push(`警告: 自动拉升后 CAI ${optimizedMetrics.cai.toFixed(3)} 仍低于阈值 ${MIN_ACCEPTABLE_CAI}，受酶切位点/GC 约束限制`);
+    }
+  }
+
+  const repeatStats = analyzeRepeatStats(finalSequence);
+  const warnings = [
+    ...result.warnings,
+    ...retainWarnings,
+    ...caiWarnings,
+    ...(polished.note ? [polished.note] : []),
+    ...(params.eliminateRepeats !== false && repeatStats.total > 0
+      ? [`检测到 ${repeatStats.total} 个重复序列区域（DR ${repeatStats.direct} / IR ${repeatStats.inverted} / PR ${repeatStats.palindromic}）`]
+      : []),
+    "[纯 JavaScript 模式] DNAWorks 引擎不可用，使用内置算法优化",
+  ];
+
+  return {
+    optimizedSequence: finalSequence,
+    cai: optimizedMetrics.cai,
+    gcContent: optimizedMetrics.gcContent,
+    changes: countCodonChanges(isProtein ? result.optimizedSequence : clean, finalSequence),
+    warnings,
+    repeatStats,
+  };
+}
+
 async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<OptimizeResult> {
   const executable = ENV.dnaWorksExecutablePath;
   if (!executable || !existsSync(executable)) {
@@ -359,15 +493,21 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
     }
 
     const effectiveParams = isDna ? { ...params, sourceDnaSequence: clean } : params;
-    const dnaInput = isProtein ? optimizeSequenceAuto(clean, effectiveParams).optimizedSequence : clean;
-    const expectedMinLength = isProtein ? clean.replace(/\*/g, "").length * 3 : 0;
-    if (dnaInput.length < 50) {
+    const proteinResidueCount = clean.replace(/\*/g, "").length;
+    const expectedMinLength = isProtein ? proteinResidueCount * 3 : 0;
+    const expectedDnaLength = isProtein ? proteinResidueCount * 3 : clean.length;
+    if (expectedDnaLength < 50) {
       throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
     }
 
     const inputPath = path.join(runDir, "DNAWORKS.inp");
     const logfilePath = path.join(runDir, "LOGFILE.txt");
-    await fs.writeFile(inputPath, buildInputTemplate(dnaInput), "utf8");
+    // Protein input feeds DNAWorks a PROTEIN block + host codon table so it keeps
+    // codon degeneracy; DNA input stays a fixed NUCLEOTIDE block.
+    const inputContent = isProtein
+      ? buildProteinInputTemplate(clean, resolveCodonTable(params.hostSpecies, params.codonTable))
+      : buildInputTemplate(clean);
+    await fs.writeFile(inputPath, inputContent, "utf8");
 
     const { stdout, stderr } = await runExecFile(executable, ["DNAWORKS.inp"], runDir);
     const logContent = existsSync(logfilePath) ? await fs.readFile(logfilePath, "utf8") : "";
@@ -381,7 +521,11 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
         throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
       }
       if (errorText.includes("Too many misprimes")) {
-        throw new Error("DNAWorks 在该序列上检测到过多 misprimes（交叉错配），未能生成可解折方案。该序列重复模块较多，当前固定 DNA 输入会使 DNAWorks 无法继续优化。");
+        throw new Error(
+          isProtein
+            ? "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），即便放开密码子选择仍无法生成可组装方案。该蛋白重复模块过多，建议拆分片段或人工调整后再试。"
+            : "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），未能生成可解折方案。该序列重复模块较多，当前固定 DNA 输入会使 DNAWorks 无法继续优化，建议改用蛋白序列输入以放开密码子选择。"
+        );
       }
       throw new Error("DNAWorks 未生成可解析的优化序列，请检查输入序列与 DNAWorks 输出");
     }
@@ -411,13 +555,12 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
         }
       }
     } else if (isProtein && effectiveParams.retainEnzymes?.length) {
-      retainWarnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略“需要保留的酶切位点”约束");
+      retainWarnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略'需要保留的酶切位点'约束");
     }
 
     let optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
     const caiWarnings: string[] = [];
     if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
-      // Auto-lift: swap in higher-frequency synonymous codons before giving up.
       const lifted = raiseCaiAboveThreshold(finalSequence, {
         hostSpecies: params.hostSpecies,
         codonTable: params.codonTable,
@@ -452,7 +595,7 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
       optimizedSequence: finalSequence,
       cai: optimizedMetrics.cai,
       gcContent: optimizedMetrics.gcContent,
-      changes: countCodonChanges(dnaInput, finalSequence),
+      changes: countCodonChanges(isProtein ? optimized : clean, finalSequence),
       warnings,
       repeatStats,
     };
@@ -466,8 +609,26 @@ export async function optimizeByStrategy(
   params: OptimizeParams,
   strategy: OptimizationStrategy = "dnaworks"
 ): Promise<OptimizeResult> {
-  if (strategy !== "dnaworks") {
-    throw new Error("仅支持 dnaworks 策略");
+  if (strategy === "js") {
+    return runPureJS(sequence, params);
   }
-  return runDNAWorks(sequence, params);
+
+  // Try DNAWorks first, fallback to pure JS if it fails
+  try {
+    return await runDNAWorks(sequence, params);
+  } catch (dnaWorksError) {
+    const errorMsg = dnaWorksError instanceof Error ? dnaWorksError.message : String(dnaWorksError);
+    // If DNAWorks binary is missing or fails to execute, fallback to JS
+    if (
+      errorMsg.includes("DNAWorks 未配置") ||
+      errorMsg.includes("ENOENT") ||
+      errorMsg.includes("Command failed") ||
+      errorMsg.includes("Exit code")
+    ) {
+      const jsResult = await runPureJS(sequence, params);
+      jsResult.warnings.push(`[DNAWorks 回退] 外部引擎调用失败：${errorMsg.split("\n")[0]}`);
+      return jsResult;
+    }
+    throw dnaWorksError;
+  }
 }
