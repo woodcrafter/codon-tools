@@ -1422,7 +1422,7 @@ SUBROUTINE Print_Melt_Histogram(num,SolutionNo)
   WRITE(UNIT=num,FMT="(20x,i2,9x,i4)") (MMIN+8),MT(9)
   WRITE(UNIT=num,FMT="(18x,'>=',i2,9x,i4)") (MMIN+9),MT(10)
   WRITE(UNIT=num,FMT='(12x," -------------------------------------")')
-  WRITE(UNIT=num,FMT="(12x'  Tm Range = ',f4.1)") (MHIGH-MLOW)
+  WRITE(UNIT=num,FMT="(12x,'  Tm Range = ',f4.1)") (MHIGH-MLOW)
   FinalScore(SolutionNo)%TmRange = (MHIGH-MLOW)
 
 END SUBROUTINE Print_Melt_Histogram

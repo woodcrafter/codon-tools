@@ -137,12 +137,20 @@ jobs:
             'ATGGCTAGCAAAGGTGAAGAACTGTTCACCGGTGTTGTTCCGATTCTGGTTGAACTGGATGGTGATGTTAACGGTCATAAATTC' \
             '//' \
             > smoke.inp
-          ./dnaworks.exe smoke.inp && rc=0 || rc=$?
+          ./dnaworks.exe smoke.inp 2>&1 | tee run.log && rc=0 || rc=$?
           echo "Smoke test exit code: $rc"
-          # A DLL load failure exits 0xc0000135 and never writes a logfile, so the
-          # LOGFILE.txt existence check is the real gate (dnaworks may STOP nonzero
-          # even on a normal run).
-          test -f LOGFILE.txt && echo "LOGFILE.txt produced -> OK" || { echo "ERROR: no LOGFILE.txt; dnaworks did not run correctly (exit $rc)." >&2; exit 1; }
+          # LOGFILE.txt is opened at startup, so its existence alone does NOT prove
+          # success. Gate on the absence of a Fortran runtime error AND the presence
+          # of a real optimized sequence in the logfile.
+          if grep -qiE 'runtime error|Error termination|Backtrace' run.log; then
+            echo "ERROR: dnaworks.exe hit a Fortran runtime error during optimization." >&2
+            exit 1
+          fi
+          if ! grep -qi 'THE DNA SEQUENCE' LOGFILE.txt; then
+            echo "ERROR: LOGFILE.txt contains no optimized sequence; run did not complete (exit $rc)." >&2
+            exit 1
+          fi
+          echo "Smoke test OK: optimization completed and emitted a DNA sequence"
 
       - name: Build frontend
         run: npx vite build
