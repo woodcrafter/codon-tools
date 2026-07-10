@@ -75,6 +75,10 @@ function downloadTemplate() {
   XLSX.writeFile(wb, "primer_synthesis_template.xlsx");
 }
 
+// Filters out CF_HTML clipboard descriptor lines (e.g. "Version:1.0",
+// "StartHTML:...", "EndFragment:...") that some editors leak into text/plain.
+const CF_HTML_HEADER_RE = /^(Version|StartHTML|EndHTML|StartFragment|EndFragment|StartSelection|EndSelection|SourceURL):/i;
+
 function parseClipboardRows(raw: string) {
   return raw
     .replace(/\u2028/g, "\n")
@@ -83,6 +87,7 @@ function parseClipboardRows(raw: string) {
     .replace(/\r/g, "\n")
     .split("\n")
     .filter(line => line.trim() !== "")
+    .filter(line => !CF_HTML_HEADER_RE.test(line.trim()))
     .map(line => line.split("\t").map(cell => cell.trim()));
 }
 

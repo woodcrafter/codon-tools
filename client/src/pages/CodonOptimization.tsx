@@ -20,6 +20,10 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { MultiSelect, type MultiSelectOption } from "@/components/ui/multi-select";
 import { parseSequenceFile, isProbablyBinary } from "@/lib/sequence-file";
 
+// Filters out CF_HTML clipboard descriptor lines (e.g. "Version:1.0",
+// "StartHTML:...", "EndFragment:...") that some editors leak into text/plain.
+const CF_HTML_HEADER_RE = /^(Version|StartHTML|EndHTML|StartFragment|EndFragment|StartSelection|EndSelection|SourceURL):/i;
+
 interface TableRow {
   id: number;
   geneName: string;
@@ -276,6 +280,7 @@ export default function CodonOptimizationPage() {
       .replace(/\r/g, "\n")
       .split("\n")
       .filter(line => line.trim() !== "")
+      .filter(line => !CF_HTML_HEADER_RE.test(line.trim()))
       .map(line => line.split("\t").map(cell => cell.trim()));
   };
 
