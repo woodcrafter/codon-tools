@@ -103,10 +103,46 @@ jobs:
         run: |
           cd vendor/dnaworks
           mingw32-make clean
-          mingw32-make FC=x86_64-w64-mingw32-gfortran FCFLAGS="-g -fbounds-check -O2 -static-libgfortran -static-libgcc" FLFLAGS="-g -static-libgfortran -static-libgcc"
+          # Fully static link so the exe carries libgfortran, libgcc, libquadmath
+          # AND libwinpthread. -static-lib{gfortran,gcc} alone still leave a dynamic
+          # dependency on libwinpthread-1.dll, which is absent when the portable app
+          # extracts to a temp dir -> STATUS_DLL_NOT_FOUND (0xc0000135) at launch.
+          mingw32-make FC=x86_64-w64-mingw32-gfortran \
+            FCFLAGS="-g -fbounds-check -O2 -static -static-libgfortran -static-libgcc" \
+            FLFLAGS="-g"
           mkdir -p ../../bin
           cp dnaworks.exe ../../bin/dnaworks-win.exe
           ls -la ../../bin/dnaworks-win.exe
+
+      - name: Verify DNAWorks is fully static
+        shell: msys2 {0}
+        run: |
+          cd vendor/dnaworks
+          echo "=== DLL dependencies ==="
+          objdump -p dnaworks.exe | grep -i 'DLL Name' || true
+          # Fail the build if any MinGW runtime DLL is still dynamically linked.
+          if objdump -p dnaworks.exe | grep -iE 'DLL Name:\s+(libgfortran|libgcc|libquadmath|libwinpthread|libstdc)'; then
+            echo "ERROR: dnaworks.exe still depends on a MinGW runtime DLL; static link failed." >&2
+            exit 1
+          fi
+          echo "=== Smoke test: run a minimal job end-to-end ==="
+          # Mirrors server buildInputTemplate(); proves the exe launches (no DLL
+          # load failure) and completes a real optimization on Windows.
+          printf '%s\n' \
+            'title "CI_SMOKE_TEST"' \
+            'logfile "LOGFILE.txt"' \
+            'timelimit 5' \
+            'solutions 1' \
+            'NUCLEOTIDE' \
+            'ATGGCTAGCAAAGGTGAAGAACTGTTCACCGGTGTTGTTCCGATTCTGGTTGAACTGGATGGTGATGTTAACGGTCATAAATTC' \
+            '//' \
+            > smoke.inp
+          ./dnaworks.exe smoke.inp && rc=0 || rc=$?
+          echo "Smoke test exit code: $rc"
+          # A DLL load failure exits 0xc0000135 and never writes a logfile, so the
+          # LOGFILE.txt existence check is the real gate (dnaworks may STOP nonzero
+          # even on a normal run).
+          test -f LOGFILE.txt && echo "LOGFILE.txt produced -> OK" || { echo "ERROR: no LOGFILE.txt; dnaworks did not run correctly (exit $rc)." >&2; exit 1; }
 
       - name: Build frontend
         run: npx vite build
