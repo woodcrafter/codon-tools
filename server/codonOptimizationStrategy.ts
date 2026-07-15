@@ -9,7 +9,6 @@ import {
   buildRetainConstraint,
   countRestrictionSiteOccurrences,
   optimizeSequence,
-  optimizeSequenceAuto,
   raiseCaiAboveThreshold,
   resolveCodonTable,
   restoreProtectedCodons,
@@ -19,10 +18,30 @@ import {
 } from "./codonOptimization";
 import { ENV } from "./_core/env";
 
-export const optimizationStrategies = ["dnaworks", "js"] as const;
-export type OptimizationStrategy = (typeof optimizationStrategies)[number];
-
 const MIN_ACCEPTABLE_CAI = 0.8;
+
+// DNAWorks flags a "potential misprime" whenever two windows of length MPLn are
+// homologous (differ in <= MaxNonId nucleotides) and share an identical MPTip-long
+// 3' tip. On highly repetitive proteins these pairs explode combinatorially and
+// overflow DNAWorks' fixed 9999-entry array, aborting with "Too many misprimes"
+// (see tools/DNAWorks/scores.f90 Find_Potential_Misprimes / Increment_Misprime_Arrays).
+// Relaxing detection — longer MPLn/TIP, smaller MAX — makes fewer pairs qualify, so
+// DNAWorks can finish. We escalate only as needed to keep the strictest viable
+// design; the misprime *weight* is irrelevant here because the overflow happens
+// during detection, before scoring.
+type MisprimeSetting = { mpLn: number; tip: number; max: number };
+
+const MISPRIME_LADDER: Array<MisprimeSetting | null> = [
+  null, // DNAWorks defaults (MPLn=18, TIP=6, MAX=8) — strictest, best assembly quality
+  { mpLn: 18, tip: 8, max: 6 },
+  { mpLn: 20, tip: 10, max: 4 },
+  { mpLn: 24, tip: 12, max: 3 },
+];
+
+function formatMisprimeLine(setting: MisprimeSetting | null): string | null {
+  if (!setting) return null;
+  return `MISPRIME ${setting.mpLn} TIP ${setting.tip} MAX ${setting.max}`;
+}
 
 type OptimizeParams = {
   hostSpecies: string;
@@ -336,12 +355,14 @@ function wrapSequence(sequence: string, width = 60): string {
   return chunks.join("\n");
 }
 
-function buildInputTemplate(sequence: string): string {
+function buildInputTemplate(sequence: string, misprime: MisprimeSetting | null = null): string {
+  const misprimeLine = formatMisprimeLine(misprime);
   return [
     'title "CODON_TOOLS_DNAWORKS"',
     'logfile "LOGFILE.txt"',
     "timelimit 30",
     "solutions 1",
+    ...(misprimeLine ? [misprimeLine] : []),
     "NUCLEOTIDE",
     wrapSequence(sequence),
     "//",
@@ -378,8 +399,13 @@ function buildCodonBlock(table: CodonTable): string {
 // Feeds DNAWorks the PROTEIN sequence plus the host codon table, letting it pick
 // synonymous codons itself. Unlike a fixed NUCLEOTIDE input this preserves codon
 // degeneracy, so DNAWorks can break up repeats and resolve misprimes.
-function buildProteinInputTemplate(protein: string, table: CodonTable): string {
+function buildProteinInputTemplate(
+  protein: string,
+  table: CodonTable,
+  misprime: MisprimeSetting | null = null
+): string {
   const residues = protein.toUpperCase().replace(/[^ACDEFGHIKLMNPQRSTVWY*]/g, "").replace(/\*/g, "X");
+  const misprimeLine = formatMisprimeLine(misprime);
   return [
     'title "CODON_TOOLS_DNAWORKS"',
     'logfile "LOGFILE.txt"',
@@ -388,6 +414,7 @@ function buildProteinInputTemplate(protein: string, table: CodonTable): string {
     // Lower than DNAWorks' 50% default so more synonymous codons stay active,
     // giving it the degeneracy it needs to break up repeats and avoid misprimes.
     "frequency threshold 10",
+    ...(misprimeLine ? [misprimeLine] : []),
     buildCodonBlock(table),
     "PROTEIN",
     wrapSequence(residues),
@@ -396,83 +423,56 @@ function buildProteinInputTemplate(protein: string, table: CodonTable): string {
   ].join("\n");
 }
 
-async function runPureJS(sequence: string, params: OptimizeParams): Promise<OptimizeResult> {
-  const clean = sequence.toUpperCase().replace(/\s/g, "");
-  const isProtein = /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(clean);
-  const isDna = /^[ATCGN]+$/.test(clean);
-  if (!isProtein && !isDna) {
-    throw new Error("序列格式无效，必须是 DNA 或蛋白序列");
+// Runs the DNAWorks binary once with a given misprime-detection setting and
+// returns the optimized DNA, or a "misprimeOverflow" marker when DNAWorks aborts
+// with "Too many misprimes" so the caller can escalate to a less sensitive level.
+type DNAWorksAttempt =
+  | { ok: true; optimized: string; stderr: string }
+  | { ok: false; misprimeOverflow: true };
+
+async function attemptDNAWorks(
+  runDir: string,
+  executable: string,
+  clean: string,
+  isProtein: boolean,
+  expectedMinLength: number,
+  params: OptimizeParams,
+  misprime: MisprimeSetting | null
+): Promise<DNAWorksAttempt> {
+  const inputPath = path.join(runDir, "DNAWORKS.inp");
+  const logfilePath = path.join(runDir, "LOGFILE.txt");
+  // Protein input feeds DNAWorks a PROTEIN block + host codon table so it keeps
+  // codon degeneracy; DNA input stays a fixed NUCLEOTIDE block.
+  const inputContent = isProtein
+    ? buildProteinInputTemplate(clean, resolveCodonTable(params.hostSpecies, params.codonTable), misprime)
+    : buildInputTemplate(clean, misprime);
+  await fs.writeFile(inputPath, inputContent, "utf8");
+
+  const { stdout, stderr } = await runExecFile(executable, ["DNAWORKS.inp"], runDir);
+  const logContent = existsSync(logfilePath) ? await fs.readFile(logfilePath, "utf8") : "";
+  const fort10Path = path.join(runDir, "fort.10");
+  const fort10Content = existsSync(fort10Path) ? await fs.readFile(fort10Path, "utf8") : "";
+  const optimized = extractOptimizedDna(logContent);
+
+  if (!optimized) {
+    const errorText = [stdout, stderr, fort10Content, logContent].filter(Boolean).join("\n");
+    if (errorText.includes("DNA length is less than 50 nt")) {
+      throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
+    }
+    // DNAWorks writes "Too many misprimes" and exits 0 (bare Fortran STOP), so it
+    // surfaces here rather than as a non-zero exit. Signal the caller to relax
+    // misprime detection instead of failing outright.
+    if (errorText.includes("Too many misprimes")) {
+      return { ok: false, misprimeOverflow: true };
+    }
+    throw new Error("DNAWorks 未生成可解析的优化序列，请检查输入序列与 DNAWorks 输出");
   }
 
-  const effectiveParams = isDna ? { ...params, sourceDnaSequence: clean } : params;
-  const result = optimizeSequenceAuto(clean, effectiveParams);
-
-  const polished = polishRepeats(result.optimizedSequence, effectiveParams);
-  let finalSequence = polished.sequence;
-  const retainWarnings: string[] = [];
-  let protectedCodonIndexes: number[] = [];
-
-  if (isDna && effectiveParams.retainEnzymes?.length) {
-    const retainConstraint = buildRetainConstraint(clean, effectiveParams.retainEnzymes);
-    protectedCodonIndexes = retainConstraint.protectedCodonIndexes;
-    finalSequence = restoreProtectedCodons(clean, finalSequence, protectedCodonIndexes);
-    for (const site of retainConstraint.missingSites) {
-      retainWarnings.push(`警告: 原始DNA序列中未找到需要保留的酶切位点 ${site}，已忽略该约束`);
-    }
-    for (const site of retainConstraint.normalizedSites) {
-      const expectedCount = retainConstraint.expectedSiteCounts[site] ?? 0;
-      if (expectedCount === 0) continue;
-      const actualCount = countRestrictionSiteOccurrences(finalSequence, site);
-      if (actualCount < expectedCount) {
-        retainWarnings.push(`警告: 需要保留的酶切位点 ${site} 未被完整保留（原始 ${expectedCount} 处，当前 ${actualCount} 处）`);
-      }
-    }
-  } else if (isProtein && effectiveParams.retainEnzymes?.length) {
-    retainWarnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略'需要保留的酶切位点'约束");
+  if (expectedMinLength && optimized.length < expectedMinLength) {
+    throw new Error(`DNAWorks 输出长度异常：期望至少 ${expectedMinLength} nt，实际 ${optimized.length} nt`);
   }
 
-  let optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
-  const caiWarnings: string[] = [];
-  if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
-    const lifted = raiseCaiAboveThreshold(finalSequence, {
-      hostSpecies: params.hostSpecies,
-      codonTable: params.codonTable,
-      avoidEnzymes: params.avoidEnzymes,
-      targetGcMin: params.targetGcMin,
-      targetGcMax: params.targetGcMax,
-      protectedCodonIndexes,
-    });
-    const liftedMetrics = scoreDnaSequence(lifted, params.hostSpecies, params.codonTable);
-    if (liftedMetrics.cai > optimizedMetrics.cai) {
-      caiWarnings.push(`CAI 自动拉升：${optimizedMetrics.cai.toFixed(3)} -> ${liftedMetrics.cai.toFixed(3)}`);
-      finalSequence = lifted;
-      optimizedMetrics = liftedMetrics;
-    }
-    if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
-      caiWarnings.push(`警告: 自动拉升后 CAI ${optimizedMetrics.cai.toFixed(3)} 仍低于阈值 ${MIN_ACCEPTABLE_CAI}，受酶切位点/GC 约束限制`);
-    }
-  }
-
-  const repeatStats = analyzeRepeatStats(finalSequence);
-  const warnings = [
-    ...result.warnings,
-    ...retainWarnings,
-    ...caiWarnings,
-    ...(polished.note ? [polished.note] : []),
-    ...(params.eliminateRepeats !== false && repeatStats.total > 0
-      ? [`检测到 ${repeatStats.total} 个重复序列区域（DR ${repeatStats.direct} / IR ${repeatStats.inverted} / PR ${repeatStats.palindromic}）`]
-      : []),
-    "[纯 JavaScript 模式] DNAWorks 引擎不可用，使用内置算法优化",
-  ];
-
-  return {
-    optimizedSequence: finalSequence,
-    cai: optimizedMetrics.cai,
-    gcContent: optimizedMetrics.gcContent,
-    changes: countCodonChanges(isProtein ? result.optimizedSequence : clean, finalSequence),
-    warnings,
-    repeatStats,
-  };
+  return { ok: true, optimized, stderr };
 }
 
 async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<OptimizeResult> {
@@ -500,39 +500,41 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
       throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
     }
 
-    const inputPath = path.join(runDir, "DNAWORKS.inp");
-    const logfilePath = path.join(runDir, "LOGFILE.txt");
-    // Protein input feeds DNAWorks a PROTEIN block + host codon table so it keeps
-    // codon degeneracy; DNA input stays a fixed NUCLEOTIDE block.
-    const inputContent = isProtein
-      ? buildProteinInputTemplate(clean, resolveCodonTable(params.hostSpecies, params.codonTable))
-      : buildInputTemplate(clean);
-    await fs.writeFile(inputPath, inputContent, "utf8");
-
-    const { stdout, stderr } = await runExecFile(executable, ["DNAWORKS.inp"], runDir);
-    const logContent = existsSync(logfilePath) ? await fs.readFile(logfilePath, "utf8") : "";
-    const fort10Path = path.join(runDir, "fort.10");
-    const fort10Content = existsSync(fort10Path) ? await fs.readFile(fort10Path, "utf8") : "";
-    const optimized = extractOptimizedDna(logContent);
+    // Escalate misprime-detection relaxation only as far as needed: the first
+    // level is DNAWorks' strict default (best assembly quality); later levels
+    // trade some mispriming stringency to keep repetitive proteins solvable.
+    let optimized: string | null = null;
+    let stderr = "";
+    let misprimeRelaxation: MisprimeSetting | null = null;
+    for (const setting of MISPRIME_LADDER) {
+      const attempt = await attemptDNAWorks(
+        runDir,
+        executable,
+        clean,
+        isProtein,
+        expectedMinLength,
+        params,
+        setting
+      );
+      if (attempt.ok) {
+        optimized = attempt.optimized;
+        stderr = attempt.stderr;
+        misprimeRelaxation = setting;
+        break;
+      }
+    }
 
     if (!optimized) {
-      const errorText = [stdout, stderr, fort10Content, logContent].filter(Boolean).join("\n");
-      if (errorText.includes("DNA length is less than 50 nt")) {
-        throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
-      }
-      if (errorText.includes("Too many misprimes")) {
-        throw new Error(
-          isProtein
-            ? "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），即便放开密码子选择仍无法生成可组装方案。该蛋白重复模块过多，建议拆分片段或人工调整后再试。"
-            : "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），未能生成可解折方案。该序列重复模块较多，当前固定 DNA 输入会使 DNAWorks 无法继续优化，建议改用蛋白序列输入以放开密码子选择。"
-        );
-      }
-      throw new Error("DNAWorks 未生成可解析的优化序列，请检查输入序列与 DNAWorks 输出");
+      throw new Error(
+        "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），即便逐级放开 misprime 检测灵敏度仍无法生成可组装方案。该蛋白重复模块过多，建议拆分片段后分别优化再拼接。"
+      );
     }
 
-    if (expectedMinLength && optimized.length < expectedMinLength) {
-      throw new Error(`DNAWorks 输出长度异常：期望至少 ${expectedMinLength} nt，实际 ${optimized.length} nt`);
-    }
+    const misprimeWarnings = misprimeRelaxation
+      ? [
+          `注意: DNAWorks 默认参数无法组装该重复序列，已放宽 misprime 检测（MPLn ${misprimeRelaxation.mpLn} / TIP ${misprimeRelaxation.tip} / MAX ${misprimeRelaxation.max}）才得到方案；合成时请加强对交叉错配的验证，必要时拆分片段。`,
+        ]
+      : [];
 
     const polished = polishRepeats(optimized, effectiveParams);
     let finalSequence = polished.sequence;
@@ -582,6 +584,7 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
     const repeatStats = analyzeRepeatStats(finalSequence);
     const warnings = [
       ...optimizedMetrics.warnings,
+      ...misprimeWarnings,
       ...retainWarnings,
       ...caiWarnings,
       ...(polished.note ? [polished.note] : []),
@@ -604,31 +607,13 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
   }
 }
 
+// DNAWorks is the only optimization engine: there is no pure-JS fallback. If
+// DNAWorks is unavailable or cannot produce a solution, the error propagates so
+// the caller records a failed run rather than silently returning a different
+// (non-DNAWorks) result.
 export async function optimizeByStrategy(
   sequence: string,
-  params: OptimizeParams,
-  strategy: OptimizationStrategy = "dnaworks"
+  params: OptimizeParams
 ): Promise<OptimizeResult> {
-  if (strategy === "js") {
-    return runPureJS(sequence, params);
-  }
-
-  // Try DNAWorks first, fallback to pure JS if it fails
-  try {
-    return await runDNAWorks(sequence, params);
-  } catch (dnaWorksError) {
-    const errorMsg = dnaWorksError instanceof Error ? dnaWorksError.message : String(dnaWorksError);
-    // If DNAWorks binary is missing or fails to execute, fallback to JS
-    if (
-      errorMsg.includes("DNAWorks 未配置") ||
-      errorMsg.includes("ENOENT") ||
-      errorMsg.includes("Command failed") ||
-      errorMsg.includes("Exit code")
-    ) {
-      const jsResult = await runPureJS(sequence, params);
-      jsResult.warnings.push(`[DNAWorks 回退] 外部引擎调用失败：${errorMsg.split("\n")[0]}`);
-      return jsResult;
-    }
-    throw dnaWorksError;
-  }
+  return runDNAWorks(sequence, params);
 }
