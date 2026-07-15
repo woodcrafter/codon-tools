@@ -71,6 +71,10 @@ function createEmptyRow(id: number): TableRow {
   };
 }
 
+// Sentinel value for the "no secondary host" option. Radix Select forbids an
+// empty-string SelectItem value, so we use a sentinel and map it back to "".
+const SECONDARY_HOST_NONE = "none";
+
 export default function CodonOptimizationPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const fillStateRef = useRef<FillState | null>(null);
@@ -717,11 +721,19 @@ export default function CodonOptimizationPage() {
                     </Tooltip>
                   </TooltipProvider>
                 </Label>
-                <Select value={secondaryHost} onValueChange={setSecondaryHost}>
+                <Select
+                  value={secondaryHost}
+                  onValueChange={(value) =>
+                    setSecondaryHost(value === SECONDARY_HOST_NONE ? "" : value)
+                  }
+                >
                   <SelectTrigger>
                     <SelectValue placeholder="请选择" />
                   </SelectTrigger>
                   <SelectContent>
+                    {/* Secondary host is optional; this lets the user clear a
+                        selection (Radix Select cannot deselect back to empty). */}
+                    <SelectItem value={SECONDARY_HOST_NONE}>无 / 不使用二级宿主</SelectItem>
                     {hostSpecies?.map((host) => (
                       <SelectItem key={host.id} value={host.id.toString()}>
                         {host.name}
