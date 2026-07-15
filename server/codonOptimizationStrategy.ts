@@ -26,21 +26,36 @@ const MIN_ACCEPTABLE_CAI = 0.8;
 // overflow DNAWorks' fixed 9999-entry array, aborting with "Too many misprimes"
 // (see tools/DNAWorks/scores.f90 Find_Potential_Misprimes / Increment_Misprime_Arrays).
 // Relaxing detection — longer MPLn/TIP, smaller MAX — makes fewer pairs qualify, so
-// DNAWorks can finish. We escalate only as needed to keep the strictest viable
-// design; the misprime *weight* is irrelevant here because the overflow happens
+// DNAWorks can finish. The misprime *weight* is irrelevant here: the overflow happens
 // during detection, before scoring.
 type MisprimeSetting = { mpLn: number; tip: number; max: number };
 
-const MISPRIME_LADDER: Array<MisprimeSetting | null> = [
-  null, // DNAWorks defaults (MPLn=18, TIP=6, MAX=8) — strictest, best assembly quality
-  { mpLn: 18, tip: 8, max: 6 },
-  { mpLn: 20, tip: 10, max: 4 },
-  { mpLn: 24, tip: 12, max: 3 },
+// A DNAWorks attempt is tuned by two knobs, escalated together only when needed:
+//   - frequencyThreshold: the FREQUENCY THR value (0-100). Higher = only high-usage
+//     codons stay active, shrinking the annealing search space (much faster) and
+//     raising CAI. Lower = more synonymous codons, giving DNAWorks the degeneracy to
+//     break up repeats. DNAWorks' own default is 50.
+//   - misprime: how sensitively DNAWorks flags misprimes (see above); null = defaults.
+// Level 0 is the strict default: fastest and highest CAI, best for typical sequences.
+// Later levels trade codon stringency + misprime stringency for solvability on
+// repetitive proteins. Escalation is cheap because a "Too many misprimes" abort is
+// effectively instant (it happens on the first scoring pass, before annealing).
+type DNAWorksTuning = { frequencyThreshold: number; misprime: MisprimeSetting | null };
+
+const DNAWORKS_LADDER: DNAWorksTuning[] = [
+  { frequencyThreshold: 50, misprime: null },
+  { frequencyThreshold: 30, misprime: { mpLn: 18, tip: 8, max: 6 } },
+  { frequencyThreshold: 15, misprime: { mpLn: 20, tip: 10, max: 4 } },
+  { frequencyThreshold: 10, misprime: { mpLn: 24, tip: 12, max: 3 } },
 ];
 
 function formatMisprimeLine(setting: MisprimeSetting | null): string | null {
   if (!setting) return null;
   return `MISPRIME ${setting.mpLn} TIP ${setting.tip} MAX ${setting.max}`;
+}
+
+function isRelaxedTuning(tuning: DNAWorksTuning): boolean {
+  return tuning.frequencyThreshold < 50 || tuning.misprime !== null;
 }
 
 type OptimizeParams = {
@@ -402,18 +417,18 @@ function buildCodonBlock(table: CodonTable): string {
 function buildProteinInputTemplate(
   protein: string,
   table: CodonTable,
-  misprime: MisprimeSetting | null = null
+  tuning: DNAWorksTuning
 ): string {
   const residues = protein.toUpperCase().replace(/[^ACDEFGHIKLMNPQRSTVWY*]/g, "").replace(/\*/g, "X");
-  const misprimeLine = formatMisprimeLine(misprime);
+  const misprimeLine = formatMisprimeLine(tuning.misprime);
   return [
     'title "CODON_TOOLS_DNAWORKS"',
     'logfile "LOGFILE.txt"',
     "timelimit 30",
     "solutions 1",
-    // Lower than DNAWorks' 50% default so more synonymous codons stay active,
-    // giving it the degeneracy it needs to break up repeats and avoid misprimes.
-    "frequency threshold 10",
+    // Codon-usage tolerance: higher keeps only preferred codons (faster + higher CAI),
+    // lower opens up synonymous codons for repeat/misprime resolution. See DNAWORKS_LADDER.
+    `frequency threshold ${tuning.frequencyThreshold}`,
     ...(misprimeLine ? [misprimeLine] : []),
     buildCodonBlock(table),
     "PROTEIN",
@@ -437,15 +452,16 @@ async function attemptDNAWorks(
   isProtein: boolean,
   expectedMinLength: number,
   params: OptimizeParams,
-  misprime: MisprimeSetting | null
+  tuning: DNAWorksTuning
 ): Promise<DNAWorksAttempt> {
   const inputPath = path.join(runDir, "DNAWORKS.inp");
   const logfilePath = path.join(runDir, "LOGFILE.txt");
   // Protein input feeds DNAWorks a PROTEIN block + host codon table so it keeps
-  // codon degeneracy; DNA input stays a fixed NUCLEOTIDE block.
+  // codon degeneracy; DNA input stays a fixed NUCLEOTIDE block (frequency threshold
+  // is irrelevant there since no residue is mutatable).
   const inputContent = isProtein
-    ? buildProteinInputTemplate(clean, resolveCodonTable(params.hostSpecies, params.codonTable), misprime)
-    : buildInputTemplate(clean, misprime);
+    ? buildProteinInputTemplate(clean, resolveCodonTable(params.hostSpecies, params.codonTable), tuning)
+    : buildInputTemplate(clean, tuning.misprime);
   await fs.writeFile(inputPath, inputContent, "utf8");
 
   const { stdout, stderr } = await runExecFile(executable, ["DNAWORKS.inp"], runDir);
@@ -500,13 +516,15 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
       throw new Error("DNAWorks 要求 DNA 序列长度至少为 50 nt，当前序列过短");
     }
 
-    // Escalate misprime-detection relaxation only as far as needed: the first
-    // level is DNAWorks' strict default (best assembly quality); later levels
-    // trade some mispriming stringency to keep repetitive proteins solvable.
+    // Start from DNAWorks' strict default (threshold 50, default misprime): it is the
+    // fastest and highest-CAI setting and handles typical sequences. Escalate — adding
+    // codon degeneracy and relaxing misprime detection — only when a level aborts with
+    // "Too many misprimes". Those aborts are effectively instant, so the common case
+    // pays for exactly one fast attempt.
     let optimized: string | null = null;
     let stderr = "";
-    let misprimeRelaxation: MisprimeSetting | null = null;
-    for (const setting of MISPRIME_LADDER) {
+    let usedTuning: DNAWorksTuning | null = null;
+    for (const tuning of DNAWORKS_LADDER) {
       const attempt = await attemptDNAWorks(
         runDir,
         executable,
@@ -514,27 +532,32 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
         isProtein,
         expectedMinLength,
         params,
-        setting
+        tuning
       );
       if (attempt.ok) {
         optimized = attempt.optimized;
         stderr = attempt.stderr;
-        misprimeRelaxation = setting;
+        usedTuning = tuning;
         break;
       }
     }
 
     if (!optimized) {
       throw new Error(
-        "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），即便逐级放开 misprime 检测灵敏度仍无法生成可组装方案。该蛋白重复模块过多，建议拆分片段后分别优化再拼接。"
+        "DNAWorks 在该序列上检测到过多 misprimes（交叉错配），即便逐级放开密码子选择与 misprime 检测灵敏度仍无法生成可组装方案。该蛋白重复模块过多，建议拆分片段后分别优化再拼接。"
       );
     }
 
-    const misprimeWarnings = misprimeRelaxation
-      ? [
-          `注意: DNAWorks 默认参数无法组装该重复序列，已放宽 misprime 检测（MPLn ${misprimeRelaxation.mpLn} / TIP ${misprimeRelaxation.tip} / MAX ${misprimeRelaxation.max}）才得到方案；合成时请加强对交叉错配的验证，必要时拆分片段。`,
-        ]
-      : [];
+    const misprimeWarnings =
+      usedTuning && isRelaxedTuning(usedTuning)
+        ? [
+            `注意: DNAWorks 默认参数无法组装该重复序列，已放宽参数（密码子频率阈值 ${usedTuning.frequencyThreshold}%${
+              usedTuning.misprime
+                ? ` / misprime 检测 MPLn ${usedTuning.misprime.mpLn}·TIP ${usedTuning.misprime.tip}·MAX ${usedTuning.misprime.max}`
+                : ""
+            }）才得到方案；合成时请加强对交叉错配的验证，必要时拆分片段。`,
+          ]
+        : [];
 
     const polished = polishRepeats(optimized, effectiveParams);
     let finalSequence = polished.sequence;
