@@ -202,7 +202,7 @@ function calculateGC(sequence: string): number {
 /**
  * Calculate Codon Adaptation Index (CAI)
  */
-function calculateCAI(sequence: string, codonTable: Record<string, Record<string, number>>): number {
+export function calculateCAI(sequence: string, codonTable: Record<string, Record<string, number>>): number {
   const cleanSeq = sequence.toUpperCase().replace(/\s/g, "");
   let totalWeight = 0;
   let codonCount = 0;
@@ -245,6 +245,21 @@ export function normalizeRestrictionSites(sites: string[] = []): string[] {
   );
 }
 
+/**
+ * A restriction site can occur on either strand. Expand non-palindromic
+ * recognition sequences to include their reverse-complement orientation.
+ */
+export function expandRestrictionSiteOrientations(sites: string[] = []): string[] {
+  const expanded = new Set<string>();
+  for (const site of normalizeRestrictionSites(sites)) {
+    expanded.add(site);
+    if (/^[ATCG]+$/.test(site)) {
+      expanded.add(reverseComplement(site));
+    }
+  }
+  return Array.from(expanded);
+}
+
 export function countRestrictionSiteOccurrences(sequence: string, enzymeSite: string): number {
   const cleanSequence = sequence.toUpperCase().replace(/\s/g, "");
   const cleanSite = enzymeSite.toUpperCase().replace(/\s/g, "").trim();
@@ -270,29 +285,37 @@ export type RetainConstraint = {
 
 export function buildRetainConstraint(sourceDnaSequence: string, retainEnzymes: string[] = []): RetainConstraint {
   const cleanSource = sourceDnaSequence.toUpperCase().replace(/\s/g, "");
-  const normalizedSites = normalizeRestrictionSites(retainEnzymes);
+  const requestedSites = normalizeRestrictionSites(retainEnzymes);
+  const normalizedSites: string[] = [];
   const protectedCodonIndexes = new Set<number>();
   const expectedSiteCounts: Record<string, number> = {};
   const missingSites: string[] = [];
 
-  for (const site of normalizedSites) {
-    let found = 0;
-    let searchFrom = 0;
-    while (searchFrom <= cleanSource.length - site.length) {
-      const foundAt = cleanSource.indexOf(site, searchFrom);
-      if (foundAt === -1) break;
-      found += 1;
-      const codonStart = Math.floor(foundAt / 3);
-      const codonEnd = Math.floor((foundAt + site.length - 1) / 3);
-      for (let codonIndex = codonStart; codonIndex <= codonEnd; codonIndex += 1) {
-        protectedCodonIndexes.add(codonIndex);
+  for (const requestedSite of requestedSites) {
+    let totalFound = 0;
+    for (const site of expandRestrictionSiteOrientations([requestedSite])) {
+      let found = 0;
+      let searchFrom = 0;
+      while (searchFrom <= cleanSource.length - site.length) {
+        const foundAt = cleanSource.indexOf(site, searchFrom);
+        if (foundAt === -1) break;
+        found += 1;
+        const codonStart = Math.floor(foundAt / 3);
+        const codonEnd = Math.floor((foundAt + site.length - 1) / 3);
+        for (let codonIndex = codonStart; codonIndex <= codonEnd; codonIndex += 1) {
+          protectedCodonIndexes.add(codonIndex);
+        }
+        searchFrom = foundAt + 1;
       }
-      searchFrom = foundAt + 1;
-    }
 
-    expectedSiteCounts[site] = found;
-    if (found === 0) {
-      missingSites.push(site);
+      if (found > 0) {
+        normalizedSites.push(site);
+        expectedSiteCounts[site] = found;
+        totalFound += found;
+      }
+    }
+    if (totalFound === 0) {
+      missingSites.push(requestedSite);
     }
   }
 
@@ -595,7 +618,8 @@ export function raiseCaiAboveThreshold(
       ? { min: params.targetGcMin, max: params.targetGcMax }
       : undefined;
   const protectedCodonIndexes = new Set(params.protectedCodonIndexes ?? []);
-  return enforceMinimumCAI(clean, protein, codonTable, params.avoidEnzymes ?? [], targetGC, protectedCodonIndexes);
+  const avoidSites = expandRestrictionSiteOrientations(params.avoidEnzymes ?? []);
+  return enforceMinimumCAI(clean, protein, codonTable, avoidSites, targetGC, protectedCodonIndexes);
 }
 
 /**
@@ -605,7 +629,8 @@ export function optimizeSequence(
   dnaSequence: string,
   params: OptimizationParams
 ): OptimizationResult {
-  const { hostSpecies, avoidEnzymes = [], retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const { hostSpecies, retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const avoidEnzymes = expandRestrictionSiteOrientations(params.avoidEnzymes ?? []);
   
   const codonTable = resolveCodonTable(hostSpecies, params.codonTable);
   const sourceDnaSequence = (params.sourceDnaSequence ?? dnaSequence).toUpperCase().replace(/\s/g, "");
@@ -710,7 +735,8 @@ export function optimizeProteinSequence(
   proteinSequence: string,
   params: OptimizationParams
 ): OptimizationResult {
-  const { hostSpecies, avoidEnzymes = [], retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const { hostSpecies, retainEnzymes = [], targetGcMin, targetGcMax, eliminateRepeats = true } = params;
+  const avoidEnzymes = expandRestrictionSiteOrientations(params.avoidEnzymes ?? []);
 
   const codonTable = resolveCodonTable(hostSpecies, params.codonTable);
 
@@ -786,14 +812,14 @@ export function optimizeSequenceAuto(
   params: OptimizationParams
 ): OptimizationResult {
   const cleanSeq = sequence.toUpperCase().replace(/\s/g, "");
-  const isProtein = /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(cleanSeq);
   const isDNA = /^[ATCGN]+$/.test(cleanSeq);
+  const isProtein = !isDNA && /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(cleanSeq);
 
-  if (isProtein) {
-    return optimizeProteinSequence(cleanSeq, params);
-  }
   if (isDNA) {
     return optimizeSequence(cleanSeq, params);
+  }
+  if (isProtein) {
+    return optimizeProteinSequence(cleanSeq, params);
   }
   throw new Error("Invalid sequence: must be DNA (ATCGN) or protein (ACDEFGHIKLMNPQRSTVWY*)");
 }

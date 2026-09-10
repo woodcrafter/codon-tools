@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { eliminateAvoidEnzymeSites } from "./codonOptimizationStrategy";
+import {
+  analyzeRepeatStats,
+  buildRetainConstraint,
+  optimizeSequenceAuto,
+  raiseCaiAboveThreshold,
+  scoreDnaSequence,
+} from "./codonOptimization";
+import { eliminateAvoidEnzymeSites, polishRepeats } from "./codonOptimizationStrategy";
 
 const GENETIC_CODE: Record<string, string> = {
   TTT: "F", TTC: "F", TTA: "L", TTG: "L",
@@ -70,6 +77,24 @@ describe("eliminateAvoidEnzymeSites", () => {
     expect(result.sequence.slice(3, 9)).toBe("GAGTTC");
   });
 
+  it("chooses the site-breaking substitution with the smallest CAI cost", () => {
+    const codonTable = {
+      E: { GAA: 0.68, GAG: 0.32 },
+      F: { TTT: 0.57, TTC: 0.43 },
+    };
+    const seq = "ATG" + "GAATTC" + "AAA";
+    const result = eliminateAvoidEnzymeSites(seq, ["GAATTC"], codonTable);
+    expect(result.sequence.slice(3, 9)).toBe("GAATTT");
+  });
+
+  it("removes a non-palindromic site in its reverse-complement orientation", () => {
+    const seq = "ATG" + "GAGACC" + "AAA";
+    const result = eliminateAvoidEnzymeSites(seq, ["GGTCTC"]);
+    expect(result.sequence).not.toContain("GGTCTC");
+    expect(result.sequence).not.toContain("GAGACC");
+    expect(translate(result.sequence)).toBe(translate(seq));
+  });
+
   it("returns the sequence unchanged when no sites are present", () => {
     const seq = "ATGGCCAAAAGTAA";
     const result = eliminateAvoidEnzymeSites(seq, ["GAATTC", "GGATCC"]);
@@ -111,5 +136,56 @@ describe("eliminateAvoidEnzymeSites", () => {
     expect(result.removed).toBe(1);
     expect(result.remainingSites).toEqual(["GAATTC"]);
     expect(translate(result.sequence)).toBe(translate(seq));
+  });
+});
+
+describe("polishRepeats", () => {
+  it("reduces repeats while preserving a retained site, translation, and CAI", () => {
+    const source = "ATG" + "GAATTC" + "AAA" + "GCT".repeat(20) + "TAA";
+    const protectedCodonIndexes = [1, 2];
+    const baseline = raiseCaiAboveThreshold(source, {
+      hostSpecies: "E. coli",
+      protectedCodonIndexes,
+    });
+    const before = analyzeRepeatStats(baseline);
+    const result = polishRepeats(baseline, {
+      hostSpecies: "E. coli",
+      retainEnzymes: ["GAATTC"],
+      sourceDnaSequence: source,
+      eliminateRepeats: true,
+    });
+    const after = analyzeRepeatStats(result.sequence);
+
+    expect(result.sequence).toContain("GAATTC");
+    expect(translate(result.sequence)).toBe(translate(source));
+    expect(scoreDnaSequence(result.sequence, "E. coli").cai).toBeGreaterThanOrEqual(0.8);
+    expect(after.total).toBeLessThan(before.total);
+  });
+});
+
+describe("sequence type detection", () => {
+  it("treats an ATGC-only sequence as DNA rather than a protein sequence", () => {
+    const source = "ATG" + "GAATTC" + "AAA" + "GCT".repeat(12) + "TAA";
+    const result = optimizeSequenceAuto(source, {
+      hostSpecies: "E. coli",
+      retainEnzymes: ["GAATTC"],
+    });
+
+    expect(result.optimizedSequence.length).toBe(source.length);
+    expect(translate(result.optimizedSequence)).toBe(translate(source));
+    expect(result.optimizedSequence).toContain("GAATTC");
+    expect(result.cai).toBeGreaterThanOrEqual(0.8);
+  });
+});
+
+describe("retain-site orientation", () => {
+  it("preserves a non-palindromic site found only as a reverse complement", () => {
+    const source = "ATG" + "GAGACC" + "AAA";
+    const constraint = buildRetainConstraint(source, ["GGTCTC"]);
+
+    expect(constraint.missingSites).toEqual([]);
+    expect(constraint.normalizedSites).toEqual(["GAGACC"]);
+    expect(constraint.expectedSiteCounts.GAGACC).toBe(1);
+    expect(constraint.protectedCodonIndexes).toEqual([1, 2]);
   });
 });

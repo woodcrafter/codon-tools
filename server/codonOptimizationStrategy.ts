@@ -7,7 +7,9 @@ import path from "node:path";
 import {
   analyzeRepeatStats,
   buildRetainConstraint,
+  calculateCAI,
   countRestrictionSiteOccurrences,
+  expandRestrictionSiteOrientations,
   optimizeSequence,
   raiseCaiAboveThreshold,
   resolveCodonTable,
@@ -138,10 +140,7 @@ function calculateRepeatPenalty(sequence: string): number {
 function hasAvoidEnzymeSite(sequence: string, avoidEnzymes: string[] = []): boolean {
   if (!avoidEnzymes.length) return false;
   const clean = sequence.toUpperCase().replace(/\s/g, "");
-  return avoidEnzymes.some((site) => {
-    const normalized = (site || "").toUpperCase().trim();
-    return normalized ? clean.includes(normalized) : false;
-  });
+  return expandRestrictionSiteOrientations(avoidEnzymes).some((site) => clean.includes(site));
 }
 
 function collectRepeatHotspotCodonIndexes(sequence: string): number[] {
@@ -220,7 +219,7 @@ export function eliminateAvoidEnzymeSites(
   protectedCodonIndexes: Set<number> = new Set()
 ): { sequence: string; removed: number; remainingSites: string[] } {
   let best = sequence.toUpperCase().replace(/\s/g, "");
-  const sites = avoidEnzymes.map((s) => (s || "").toUpperCase().trim()).filter(Boolean);
+  const sites = expandRestrictionSiteOrientations(avoidEnzymes);
   if (!sites.length || best.length < 3) {
     return { sequence: best, removed: 0, remainingSites: [] };
   }
@@ -232,57 +231,66 @@ export function eliminateAvoidEnzymeSites(
   for (let iter = 0; iter < maxIterations && total > 0; iter++) {
     const hits = listAvoidEnzymeSites(best, sites);
     if (!hits.length) break;
-    let progress = false;
+    let bestMutation: { sequence: string; total: number; caiDelta: number; repeatPenalty: number } | null = null;
 
     for (const hit of hits) {
       const firstCodon = Math.floor(hit.index / 3);
       const lastCodon = Math.floor((hit.index + hit.site.length - 1) / 3);
-      let siteFixed = false;
 
-      for (let codonIndex = firstCodon; codonIndex <= lastCodon && !siteFixed; codonIndex++) {
+      for (let codonIndex = firstCodon; codonIndex <= lastCodon; codonIndex++) {
         if (protectedCodonIndexes.has(codonIndex)) continue;
         const start = codonIndex * 3;
         if (start + 3 > best.length) continue;
         const currentCodon = best.slice(start, start + 3);
         const aa = GENETIC_CODE[currentCodon];
         if (!aa || aa === "*") continue;
-        let candidates = (AA_TO_CODONS[aa] || []).filter((c) => c !== currentCodon);
+        const candidates = (AA_TO_CODONS[aa] || []).filter((c) => c !== currentCodon);
         const weights = codonTable?.[aa];
-        if (weights) {
-          candidates = candidates.sort((a, b) => (weights[b] || 0) - (weights[a] || 0));
-        }
 
         for (const alt of candidates) {
           const mutated = replaceCodonAt(best, codonIndex, alt);
           const mutatedTotal = countAvoidEnzymeSites(mutated, sites);
-          if (mutatedTotal < total) {
-            best = mutated;
-            total = mutatedTotal;
-            siteFixed = true;
-            progress = true;
-            break;
+          if (mutatedTotal >= total) continue;
+
+          const maxWeight = weights ? Math.max(...Object.values(weights)) : 0;
+          const currentWeight = maxWeight > 0 ? Math.max(weights?.[currentCodon] || 0, 1e-6) / maxWeight : 1;
+          const alternateWeight = maxWeight > 0 ? Math.max(weights?.[alt] || 0, 1e-6) / maxWeight : 1;
+          const caiDelta = Math.log(alternateWeight) - Math.log(currentWeight);
+          const repeatPenalty = calculateRepeatPenalty(mutated);
+          const removesMore = !bestMutation || mutatedTotal < bestMutation.total;
+          const betterCai =
+            bestMutation && mutatedTotal === bestMutation.total && caiDelta > bestMutation.caiDelta + 1e-9;
+          const betterRepeatTie =
+            bestMutation &&
+            mutatedTotal === bestMutation.total &&
+            Math.abs(caiDelta - bestMutation.caiDelta) <= 1e-9 &&
+            repeatPenalty < bestMutation.repeatPenalty - 1e-9;
+          if (removesMore || betterCai || betterRepeatTie) {
+            bestMutation = { sequence: mutated, total: mutatedTotal, caiDelta, repeatPenalty };
           }
         }
       }
-      if (siteFixed) break; // re-scan from the top after each successful fix
     }
 
-    if (!progress) break; // remaining sites cannot be removed synonymously
+    if (!bestMutation) break; // remaining sites cannot be removed synonymously
+    best = bestMutation.sequence;
+    total = bestMutation.total;
   }
 
   const remainingSites = listAvoidEnzymeSites(best, sites).map((h) => h.site);
   return { sequence: best, removed: initialTotal - total, remainingSites };
 }
 
-function polishRepeats(sequence: string, params: OptimizeParams): { sequence: string; changed: boolean; note?: string } {
+export function polishRepeats(sequence: string, params: OptimizeParams): { sequence: string; changed: boolean; note?: string } {
   if (params.eliminateRepeats === false) {
     return { sequence, changed: false };
   }
 
   const baseline = scoreDnaSequence(sequence, params.hostSpecies, params.codonTable);
+  const codonTable = resolveCodonTable(params.hostSpecies, params.codonTable);
   let bestSequence = sequence.toUpperCase().replace(/\s/g, "");
   let bestPenalty = calculateRepeatPenalty(bestSequence);
-  let bestCai = baseline.cai;
+  let bestCai = calculateCAI(bestSequence, codonTable);
   const baselineHasAvoid = hasAvoidEnzymeSite(bestSequence, params.avoidEnzymes || []);
   const protectedCodonIndexes = new Set(
     params.sourceDnaSequence
@@ -298,16 +306,20 @@ function polishRepeats(sequence: string, params: OptimizeParams): { sequence: st
       hostSpecies: params.hostSpecies,
       codonTable: params.codonTable,
       avoidEnzymes: params.avoidEnzymes,
+      retainEnzymes: params.retainEnzymes,
+      sourceDnaSequence: params.sourceDnaSequence,
       targetGcMin: params.targetGcMin,
       targetGcMax: params.targetGcMax,
       eliminateRepeats: true,
     }).optimizedSequence;
 
     const polishedPenalty = calculateRepeatPenalty(polished);
-    if (polishedPenalty < bestPenalty) {
+    const introducesAvoidSite =
+      !baselineHasAvoid && hasAvoidEnzymeSite(polished, params.avoidEnzymes || []);
+    if (!introducesAvoidSite && polishedPenalty < bestPenalty) {
       bestSequence = polished;
       bestPenalty = polishedPenalty;
-      bestCai = scoreDnaSequence(bestSequence, params.hostSpecies, params.codonTable).cai;
+      bestCai = calculateCAI(bestSequence, codonTable);
     }
   } catch {
     // Keep DNAWorks output if local polish fails.
@@ -349,7 +361,7 @@ function polishRepeats(sequence: string, params: OptimizeParams): { sequence: st
         const penalty = calculateRepeatPenalty(mutated);
         if (penalty > localBestPenalty + 1e-9) continue;
 
-        const cai = scoreDnaSequence(mutated, params.hostSpecies, params.codonTable).cai;
+        const cai = calculateCAI(mutated, codonTable);
         if (cai < minPolishCai) continue;
 
         const betterPenalty = penalty < localBestPenalty - 1e-9;
@@ -402,6 +414,15 @@ function countCodonChanges(source: string, target: string): number {
   }
 
   return changes;
+}
+
+function translateDna(sequence: string): string {
+  const clean = sequence.toUpperCase().replace(/\s/g, "");
+  let protein = "";
+  for (let i = 0; i + 3 <= clean.length; i += 3) {
+    protein += GENETIC_CODE[clean.slice(i, i + 3)] || "?";
+  }
+  return protein;
 }
 
 function runExecFile(command: string, args: string[], cwd: string): Promise<{ stdout: string; stderr: string }> {
@@ -467,7 +488,7 @@ function buildInputTemplate(sequence: string, misprime: MisprimeSetting | null =
   return [
     'title "CODON_TOOLS_DNAWORKS"',
     'logfile "LOGFILE.txt"',
-    "timelimit 30",
+    "timelimit 0",
     "solutions 1",
     ...(misprimeLine ? [misprimeLine] : []),
     "NUCLEOTIDE",
@@ -516,7 +537,7 @@ function buildProteinInputTemplate(
   return [
     'title "CODON_TOOLS_DNAWORKS"',
     'logfile "LOGFILE.txt"',
-    "timelimit 30",
+    "timelimit 0",
     "solutions 1",
     // Codon-usage tolerance: higher keeps only preferred codons (faster + higher CAI),
     // lower opens up synonymous codons for repeat/misprime resolution. See DNAWORKS_LADDER.
@@ -579,6 +600,9 @@ async function attemptDNAWorks(
   if (expectedMinLength && optimized.length < expectedMinLength) {
     throw new Error(`DNAWorks 输出长度异常：期望至少 ${expectedMinLength} nt，实际 ${optimized.length} nt`);
   }
+  if (!isProtein && optimized.length !== clean.length) {
+    throw new Error(`DNAWorks 输出长度异常：DNA 输入 ${clean.length} nt，输出 ${optimized.length} nt`);
+  }
 
   return { ok: true, optimized, stderr };
 }
@@ -594,13 +618,23 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
 
   try {
     const clean = sequence.toUpperCase().replace(/\s/g, "");
-    const isProtein = /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(clean);
     const isDna = /^[ATCGN]+$/.test(clean);
+    const isProtein = !isDna && /^[ACDEFGHIKLMNPQRSTVWY*]+$/.test(clean);
     if (!isProtein && !isDna) {
       throw new Error("序列格式无效，必须是 DNA 或蛋白序列");
     }
 
     const effectiveParams = isDna ? { ...params, sourceDnaSequence: clean } : params;
+    const resolvedCodonTable = resolveCodonTable(params.hostSpecies, params.codonTable);
+    if (isDna) {
+      const avoidSites = new Set(expandRestrictionSiteOrientations(effectiveParams.avoidEnzymes || []));
+      const conflicts = expandRestrictionSiteOrientations(effectiveParams.retainEnzymes || []).filter((site) =>
+        avoidSites.has(site)
+      );
+      if (conflicts.length) {
+        throw new Error(`酶切位点约束冲突：${Array.from(new Set(conflicts)).join(", ")} 不能同时设为避免和保留`);
+      }
+    }
     const proteinResidueCount = clean.replace(/\*/g, "").length;
     const expectedMinLength = isProtein ? proteinResidueCount * 3 : 0;
     const expectedDnaLength = isProtein ? proteinResidueCount * 3 : clean.length;
@@ -651,8 +685,7 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
           ]
         : [];
 
-    const polished = polishRepeats(optimized, effectiveParams);
-    let finalSequence = polished.sequence;
+    let finalSequence = optimized;
     const retainWarnings: string[] = [];
     let protectedCodonIndexes: number[] = [];
 
@@ -663,53 +696,109 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
       for (const site of retainConstraint.missingSites) {
         retainWarnings.push(`警告: 原始DNA序列中未找到需要保留的酶切位点 ${site}，已忽略该约束`);
       }
-      for (const site of retainConstraint.normalizedSites) {
-        const expectedCount = retainConstraint.expectedSiteCounts[site] ?? 0;
-        if (expectedCount === 0) continue;
-        const actualCount = countRestrictionSiteOccurrences(finalSequence, site);
-        if (actualCount < expectedCount) {
-          retainWarnings.push(`警告: 需要保留的酶切位点 ${site} 未被完整保留（原始 ${expectedCount} 处，当前 ${actualCount} 处）`);
-        }
-      }
     } else if (isProtein && effectiveParams.retainEnzymes?.length) {
       retainWarnings.push("警告: 蛋白序列输入无法识别原始DNA中的酶切位点，已忽略'需要保留的酶切位点'约束");
     }
 
-    let optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
+    let removedAvoidSites = 0;
+    let avoidCleanup = eliminateAvoidEnzymeSites(
+      finalSequence,
+      effectiveParams.avoidEnzymes || [],
+      resolvedCodonTable,
+      new Set(protectedCodonIndexes)
+    );
+    finalSequence = avoidCleanup.sequence;
+    removedAvoidSites += avoidCleanup.removed;
+
+    let optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, resolvedCodonTable);
     const caiWarnings: string[] = [];
-    if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
+    if (calculateCAI(finalSequence, resolvedCodonTable) < MIN_ACCEPTABLE_CAI) {
+      const currentCai = calculateCAI(finalSequence, resolvedCodonTable);
       const lifted = raiseCaiAboveThreshold(finalSequence, {
         hostSpecies: params.hostSpecies,
-        codonTable: params.codonTable,
+        codonTable: resolvedCodonTable,
         avoidEnzymes: params.avoidEnzymes,
         targetGcMin: params.targetGcMin,
         targetGcMax: params.targetGcMax,
         protectedCodonIndexes,
       });
-      const liftedMetrics = scoreDnaSequence(lifted, params.hostSpecies, params.codonTable);
-      if (liftedMetrics.cai > optimizedMetrics.cai) {
-        caiWarnings.push(`CAI 自动拉升：${optimizedMetrics.cai.toFixed(3)} -> ${liftedMetrics.cai.toFixed(3)}`);
+      const liftedCai = calculateCAI(lifted, resolvedCodonTable);
+      const liftedMetrics = scoreDnaSequence(lifted, params.hostSpecies, resolvedCodonTable);
+      if (liftedCai > currentCai + 1e-12) {
+        caiWarnings.push(`CAI 自动拉升：${currentCai.toFixed(3)} -> ${liftedCai.toFixed(3)}`);
         finalSequence = lifted;
         optimizedMetrics = liftedMetrics;
       }
-      if (optimizedMetrics.cai < MIN_ACCEPTABLE_CAI) {
-        caiWarnings.push(`警告: 自动拉升后 CAI ${optimizedMetrics.cai.toFixed(3)} 仍低于阈值 ${MIN_ACCEPTABLE_CAI}，受酶切位点/GC 约束限制`);
+    }
+
+    const polished = polishRepeats(finalSequence, {
+      ...effectiveParams,
+      codonTable: resolvedCodonTable,
+    });
+    finalSequence = polished.sequence;
+
+    // Defensive final pass: repeat polishing is constrained not to create an
+    // avoided site, but cleanup here keeps that invariant explicit.
+    avoidCleanup = eliminateAvoidEnzymeSites(
+      finalSequence,
+      effectiveParams.avoidEnzymes || [],
+      resolvedCodonTable,
+      new Set(protectedCodonIndexes)
+    );
+    finalSequence = avoidCleanup.sequence;
+    removedAvoidSites += avoidCleanup.removed;
+    optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, resolvedCodonTable);
+
+    if (calculateCAI(finalSequence, resolvedCodonTable) < MIN_ACCEPTABLE_CAI) {
+      const currentCai = calculateCAI(finalSequence, resolvedCodonTable);
+      const lifted = raiseCaiAboveThreshold(finalSequence, {
+        hostSpecies: params.hostSpecies,
+        codonTable: resolvedCodonTable,
+        avoidEnzymes: params.avoidEnzymes,
+        targetGcMin: params.targetGcMin,
+        targetGcMax: params.targetGcMax,
+        protectedCodonIndexes,
+      });
+      const liftedCai = calculateCAI(lifted, resolvedCodonTable);
+      const liftedMetrics = scoreDnaSequence(lifted, params.hostSpecies, resolvedCodonTable);
+      if (liftedCai > currentCai + 1e-12) {
+        caiWarnings.push(`CAI 自动拉升：${currentCai.toFixed(3)} -> ${liftedCai.toFixed(3)}`);
+        finalSequence = lifted;
+        optimizedMetrics = liftedMetrics;
       }
     }
 
-    // DNAWorks has no avoid-site directive, so sites it introduces must be
-    // removed here via synonymous substitution. Runs last so it also covers
-    // sites introduced by repeat polishing or the CAI lift; codons protected
-    // by retain-enzyme constraints are left untouched.
-    const avoidCleanup = eliminateAvoidEnzymeSites(
-      finalSequence,
-      effectiveParams.avoidEnzymes || [],
-      params.codonTable,
-      new Set(protectedCodonIndexes)
-    );
-    if (avoidCleanup.sequence !== finalSequence) {
-      finalSequence = avoidCleanup.sequence;
-      optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
+    if (avoidCleanup.remainingSites.length) {
+      throw new Error(
+        `无法在保持翻译和保留位点约束的同时消除限制性酶切位点 ${Array.from(new Set(avoidCleanup.remainingSites)).join(", ")}`
+      );
+    }
+    const finalCai = calculateCAI(finalSequence, resolvedCodonTable);
+    if (finalCai < MIN_ACCEPTABLE_CAI) {
+      throw new Error(
+        `无法同时满足酶切位点/GC约束与 CAI 要求：最终 CAI ${finalCai.toFixed(3)}，要求至少 ${MIN_ACCEPTABLE_CAI}`
+      );
+    }
+
+    if (isDna && effectiveParams.retainEnzymes?.length) {
+      const retainConstraint = buildRetainConstraint(clean, effectiveParams.retainEnzymes);
+      for (const site of retainConstraint.normalizedSites) {
+        const expectedCount = retainConstraint.expectedSiteCounts[site] ?? 0;
+        if (expectedCount === 0) continue;
+        const actualCount = countRestrictionSiteOccurrences(finalSequence, site);
+        if (actualCount < expectedCount) {
+          throw new Error(
+            `需要保留的酶切位点 ${site} 未被完整保留（原始 ${expectedCount} 处，当前 ${actualCount} 处）`
+          );
+        }
+      }
+    }
+
+    if (isDna && finalSequence.length !== clean.length) {
+      throw new Error(`优化结果长度异常：输入 ${clean.length} nt，输出 ${finalSequence.length} nt`);
+    }
+    if (isDna && translateDna(finalSequence) !== translateDna(clean)) {
+      throw new Error("优化结果与原始 DNA 的翻译产物不一致");
     }
 
     const repeatStats = analyzeRepeatStats(finalSequence);
@@ -718,10 +807,7 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
       ...misprimeWarnings,
       ...retainWarnings,
       ...caiWarnings,
-      ...(avoidCleanup.removed > 0 ? [`酶切位点消除：同义替换移除 ${avoidCleanup.removed} 处应避免位点`] : []),
-      ...(avoidCleanup.remainingSites.length
-        ? [`警告: 优化后的序列仍包含限制性酶切位点 ${Array.from(new Set(avoidCleanup.remainingSites)).join(", ")}`]
-        : []),
+      ...(removedAvoidSites > 0 ? [`酶切位点消除：同义替换移除 ${removedAvoidSites} 处应避免位点`] : []),
       ...(polished.note ? [polished.note] : []),
       ...(params.eliminateRepeats !== false && repeatStats.total > 0
         ? [`检测到 ${repeatStats.total} 个重复序列区域（DR ${repeatStats.direct} / IR ${repeatStats.inverted} / PR ${repeatStats.palindromic}）`]
@@ -731,7 +817,7 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
 
     return {
       optimizedSequence: finalSequence,
-      cai: optimizedMetrics.cai,
+      cai: Math.round(finalCai * 1000) / 1000,
       gcContent: optimizedMetrics.gcContent,
       changes: countCodonChanges(isProtein ? optimized : clean, finalSequence),
       warnings,
