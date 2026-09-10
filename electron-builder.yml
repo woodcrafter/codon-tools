@@ -36,7 +36,9 @@ mac:
       arch:
         - arm64
 win:
-  signAndEditExecutable: false
+  # Let electron-builder write ProductVersion/FileVersion into the PE resource.
+  signAndEditExecutable: true
+  artifactName: "codon-tools-${version}-${arch}.${ext}"
   target:
     - target: portable
       arch:
