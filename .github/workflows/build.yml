@@ -65,8 +65,6 @@ jobs:
 
       - name: Build macOS dmg
         run: npx electron-builder --mac
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
@@ -187,8 +185,6 @@ jobs:
 
       - name: Build Windows exe
         run: npx electron-builder --win
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
