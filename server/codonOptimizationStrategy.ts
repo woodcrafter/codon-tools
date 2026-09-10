@@ -182,6 +182,98 @@ function replaceCodonAt(sequence: string, codonIndex: number, codon: string): st
   return sequence.slice(0, start) + codon + sequence.slice(start + 3);
 }
 
+function countAvoidEnzymeSites(sequence: string, avoidEnzymes: string[]): number {
+  return avoidEnzymes.reduce(
+    (total, site) => total + countRestrictionSiteOccurrences(sequence, site),
+    0
+  );
+}
+
+function listAvoidEnzymeSites(sequence: string, avoidEnzymes: string[]): { site: string; index: number }[] {
+  const clean = sequence.toUpperCase().replace(/\s/g, "");
+  const hits: { site: string; index: number }[] = [];
+  for (const raw of avoidEnzymes) {
+    const site = (raw || "").toUpperCase().trim();
+    if (!site) continue;
+    let idx = clean.indexOf(site);
+    while (idx >= 0) {
+      hits.push({ site, index: idx });
+      idx = clean.indexOf(site, idx + 1);
+    }
+  }
+  return hits.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * Remove pre-existing avoid-enzyme sites from a DNA sequence via synonymous
+ * codon substitution. DNAWorks has no "avoid site" directive, so sites it
+ * introduces must be eliminated in post-processing. A substitution is only
+ * accepted when the total number of avoid sites strictly decreases, which
+ * guarantees no new site is created elsewhere while removing one. Codons
+ * protected by retain-enzyme constraints are never touched, and stop codons
+ * are skipped, so translation and retained sites are preserved.
+ */
+export function eliminateAvoidEnzymeSites(
+  sequence: string,
+  avoidEnzymes: string[] = [],
+  codonTable?: CodonTable,
+  protectedCodonIndexes: Set<number> = new Set()
+): { sequence: string; removed: number; remainingSites: string[] } {
+  let best = sequence.toUpperCase().replace(/\s/g, "");
+  const sites = avoidEnzymes.map((s) => (s || "").toUpperCase().trim()).filter(Boolean);
+  if (!sites.length || best.length < 3) {
+    return { sequence: best, removed: 0, remainingSites: [] };
+  }
+
+  let total = countAvoidEnzymeSites(best, sites);
+  const initialTotal = total;
+  const maxIterations = initialTotal * 20 + 50;
+
+  for (let iter = 0; iter < maxIterations && total > 0; iter++) {
+    const hits = listAvoidEnzymeSites(best, sites);
+    if (!hits.length) break;
+    let progress = false;
+
+    for (const hit of hits) {
+      const firstCodon = Math.floor(hit.index / 3);
+      const lastCodon = Math.floor((hit.index + hit.site.length - 1) / 3);
+      let siteFixed = false;
+
+      for (let codonIndex = firstCodon; codonIndex <= lastCodon && !siteFixed; codonIndex++) {
+        if (protectedCodonIndexes.has(codonIndex)) continue;
+        const start = codonIndex * 3;
+        if (start + 3 > best.length) continue;
+        const currentCodon = best.slice(start, start + 3);
+        const aa = GENETIC_CODE[currentCodon];
+        if (!aa || aa === "*") continue;
+        let candidates = (AA_TO_CODONS[aa] || []).filter((c) => c !== currentCodon);
+        const weights = codonTable?.[aa];
+        if (weights) {
+          candidates = candidates.sort((a, b) => (weights[b] || 0) - (weights[a] || 0));
+        }
+
+        for (const alt of candidates) {
+          const mutated = replaceCodonAt(best, codonIndex, alt);
+          const mutatedTotal = countAvoidEnzymeSites(mutated, sites);
+          if (mutatedTotal < total) {
+            best = mutated;
+            total = mutatedTotal;
+            siteFixed = true;
+            progress = true;
+            break;
+          }
+        }
+      }
+      if (siteFixed) break; // re-scan from the top after each successful fix
+    }
+
+    if (!progress) break; // remaining sites cannot be removed synonymously
+  }
+
+  const remainingSites = listAvoidEnzymeSites(best, sites).map((h) => h.site);
+  return { sequence: best, removed: initialTotal - total, remainingSites };
+}
+
 function polishRepeats(sequence: string, params: OptimizeParams): { sequence: string; changed: boolean; note?: string } {
   if (params.eliminateRepeats === false) {
     return { sequence, changed: false };
@@ -604,12 +696,32 @@ async function runDNAWorks(sequence: string, params: OptimizeParams): Promise<Op
         caiWarnings.push(`警告: 自动拉升后 CAI ${optimizedMetrics.cai.toFixed(3)} 仍低于阈值 ${MIN_ACCEPTABLE_CAI}，受酶切位点/GC 约束限制`);
       }
     }
+
+    // DNAWorks has no avoid-site directive, so sites it introduces must be
+    // removed here via synonymous substitution. Runs last so it also covers
+    // sites introduced by repeat polishing or the CAI lift; codons protected
+    // by retain-enzyme constraints are left untouched.
+    const avoidCleanup = eliminateAvoidEnzymeSites(
+      finalSequence,
+      effectiveParams.avoidEnzymes || [],
+      params.codonTable,
+      new Set(protectedCodonIndexes)
+    );
+    if (avoidCleanup.sequence !== finalSequence) {
+      finalSequence = avoidCleanup.sequence;
+      optimizedMetrics = scoreDnaSequence(finalSequence, params.hostSpecies, params.codonTable);
+    }
+
     const repeatStats = analyzeRepeatStats(finalSequence);
     const warnings = [
       ...optimizedMetrics.warnings,
       ...misprimeWarnings,
       ...retainWarnings,
       ...caiWarnings,
+      ...(avoidCleanup.removed > 0 ? [`酶切位点消除：同义替换移除 ${avoidCleanup.removed} 处应避免位点`] : []),
+      ...(avoidCleanup.remainingSites.length
+        ? [`警告: 优化后的序列仍包含限制性酶切位点 ${Array.from(new Set(avoidCleanup.remainingSites)).join(", ")}`]
+        : []),
       ...(polished.note ? [polished.note] : []),
       ...(params.eliminateRepeats !== false && repeatStats.total > 0
         ? [`检测到 ${repeatStats.total} 个重复序列区域（DR ${repeatStats.direct} / IR ${repeatStats.inverted} / PR ${repeatStats.palindromic}）`]
